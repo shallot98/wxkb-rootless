@@ -32,6 +32,27 @@ THEOS=/path/to/theos THEOS_PACKAGE_SCHEME=rootless make clean package
 THEOS=/path/to/theos THEOS_PACKAGE_SCHEME=roothide make clean package
 ```
 
+### 本地稳定 rootless 编译（已验证可注入）
+
+当设备对签名格式敏感时，优先使用下面脚本（会更新 Theos、升级 ldid，再打包 rootless arm64）：
+
+```bash
+./scripts/build-rootless-stable.sh
+```
+
+常用参数：
+
+```bash
+# 指定版本号
+PACKAGE_VERSION=1.0.0-70 ./scripts/build-rootless-stable.sh
+
+# 跳过 Theos 更新
+UPDATE_THEOS=0 ./scripts/build-rootless-stable.sh
+
+# 跳过 ldid 升级（已升级过时）
+UPDATE_LDID=0 ./scripts/build-rootless-stable.sh
+```
+
 ## 安装方法
 
 ### 方法1: 手动安装
