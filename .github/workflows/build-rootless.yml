@@ -39,7 +39,7 @@ jobs:
         with:
           path: |
             ${{ github.workspace }}/theos
-          key: theos-${{ runner.os }}-v1
+          key: theos-${{ runner.os }}-v2
 
       - name: Setup Theos
         run: |
@@ -49,10 +49,11 @@ jobs:
             git -C "$THEOS" pull --ff-only
             git -C "$THEOS" submodule update --init --recursive
           fi
-          if [ ! -d "$THEOS/sdks" ] || [ -z "$(ls -A "$THEOS/sdks" 2>/dev/null)" ]; then
+          if ! find "$THEOS/sdks" -maxdepth 1 -type d -name "*.sdk" | grep -q .; then
             rm -rf "$THEOS/sdks"
             git clone https://github.com/theos/sdks.git "$THEOS/sdks"
           fi
+          find "$THEOS/sdks" -maxdepth 1 -type d -name "*.sdk" | sort
 
       - name: Build rootless arm64 package
         run: |
