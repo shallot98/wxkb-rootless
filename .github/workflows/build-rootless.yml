@@ -11,7 +11,7 @@ on:
 
 jobs:
   build-rootless:
-    runs-on: ubuntu-22.04
+    runs-on: macos-14
     env:
       THEOS: ${{ github.workspace }}/theos
       TARGET: iphone:clang:13.7:14.0
@@ -20,26 +20,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Build Dependencies
+      - name: Install Dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            fakeroot \
-            git \
-            perl \
-            xz-utils \
-            lzma \
-            zip \
-            unzip \
-            curl
+          brew install ldid
 
       - name: Cache Theos
         uses: actions/cache@v4
         with:
           path: |
             ${{ github.workspace }}/theos
-          key: theos-${{ runner.os }}-v2
+          key: theos-${{ runner.os }}-v3
 
       - name: Setup Theos
         run: |
@@ -49,9 +39,15 @@ jobs:
             git -C "$THEOS" pull --ff-only
             git -C "$THEOS" submodule update --init --recursive
           fi
+          mkdir -p "$THEOS/sdks"
           if ! find "$THEOS/sdks" -maxdepth 1 -type d -name "*.sdk" | grep -q .; then
             rm -rf "$THEOS/sdks"
-            git clone https://github.com/theos/sdks.git "$THEOS/sdks"
+            mkdir -p "$THEOS/sdks"
+            cd "$THEOS/sdks"
+            curl -LO https://github.com/theos/sdks/archive/master.zip
+            unzip -q master.zip
+            mv sdks-master/* .
+            rm -rf sdks-master master.zip
           fi
           find "$THEOS/sdks" -maxdepth 1 -type d -name "*.sdk" | sort
 
