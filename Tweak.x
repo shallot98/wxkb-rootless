@@ -2,7 +2,6 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <limits.h>
-#include <unistd.h>
 
 static BOOL gWKSInSwitch = NO;
 static BOOL gWKSSwitchScheduled = NO;
@@ -10,47 +9,19 @@ static CFAbsoluteTime gWKSLastSwitchTs = 0;
 static int gWKSSwipeCallbackDepth = 0;
 
 static const NSTimeInterval kWKSDebounceSeconds = 0.25;
-static const NSTimeInterval kWKSScheduleDelaySeconds = 0.25;
+static const NSTimeInterval kWKSScheduleDelaySeconds = 0.06;
 static const NSTimeInterval kWKSSwitchCooldownSeconds = 0.45;
-
-static void WKSDebugEvent(NSString *event, NSString *detail) {
-    @autoreleasepool {
-        NSString *tmp = NSTemporaryDirectory();
-        if (tmp.length == 0) {
-            tmp = @"/tmp";
-        }
-        NSString *path = [tmp stringByAppendingPathComponent:@"wks_inject_marker.log"];
-        NSString *line = [NSString stringWithFormat:@"%.3f pid=%d %@ %@\n",
-                          CFAbsoluteTimeGetCurrent(),
-                          getpid(),
-                          event ?: @"event",
-                          detail ?: @""];
-        NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
-        NSFileManager *fm = [NSFileManager defaultManager];
-        if (![fm fileExistsAtPath:path]) {
-            [data writeToFile:path atomically:YES];
-            return;
-        }
-        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
-        if (!fh) {
-            [data writeToFile:path atomically:YES];
-            return;
-        }
-        @try {
-            [fh seekToEndOfFile];
-            [fh writeData:data];
-            [fh closeFile];
-        } @catch (__unused NSException *e) {
-        }
-    }
-}
+static const NSTimeInterval kWKSAdjustingRetryDelaySeconds = 0.03;
+static const int kWKSAdjustingMaxRetries = 6;
 
 static void (*gOrigPanelSwipeUp)(id, SEL, id) = NULL;
 static void (*gOrigPanelSwipeDown)(id, SEL, id) = NULL;
+static void (*gOrigPanelSwipeEnded)(id, SEL, id, id) = NULL;
 static void (*gOrigT9SwipeUp)(id, SEL, id) = NULL;
 static void (*gOrigT9SwipeDown)(id, SEL, id) = NULL;
 static void (*gOrigT26SwipeUp)(id, SEL, id) = NULL;
 static void (*gOrigT26SwipeDown)(id, SEL, id) = NULL;
+static long long (*gOrigPanelTryRecognizeSwipeTouch)(id, SEL, id, id, unsigned long long *, BOOL) = NULL;
 
 static void (*gOrigPanelDidAttachHosting)(id, SEL) = NULL;
 static void (*gOrigT9DidAttachHosting)(id, SEL) = NULL;
@@ -66,36 +37,9 @@ static void (*gOrigGridBoderFillLayerFill)(id, SEL, CGSize, CGRect, CGSize) = NU
 static void (*gOrigBorderLayerLayoutSublayers)(id, SEL) = NULL;
 static void (*gOrigSymbolCellSetBorderPosition)(id, SEL, unsigned long long) = NULL;
 
-@class WKSSwipeGestureDelegate;
-static WKSSwipeGestureDelegate *gWKSGestureDelegate = nil;
-static char kWKSInstalledKey;
-static char kWKSTargetKey;
-
 static void WKSHandleSwipe(id context);
-
-@interface WKSSwipeGestureDelegate : NSObject <UIGestureRecognizerDelegate>
-@end
-
-@implementation WKSSwipeGestureDelegate
-- (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer
-shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)otherGestureRecognizer {
-    (void)gestureRecognizer;
-    (void)otherGestureRecognizer;
-    return YES;
-}
-@end
-
-@interface WKSSwipeTarget : NSObject
-@end
-
-@implementation WKSSwipeTarget
-- (void)wks_handleSwipe:(UISwipeGestureRecognizer *)gr {
-    if (gr.state != UIGestureRecognizerStateRecognized) {
-        return;
-    }
-    WKSHandleSwipe(gr.view);
-}
-@end
+static void WKSAttemptToggleWhenReady(id context, int retries);
+static void WKSSwizzleClassMethod(Class cls, SEL sel, IMP newImp, IMP *oldStore);
 
 static BOOL WKSInvokeLongLongGetter(id obj, SEL sel, long long *outValue) {
     if (!obj || !sel || !outValue || ![obj respondsToSelector:sel]) {
@@ -149,6 +93,30 @@ static BOOL WKSInvokeVoidNoArg(id obj, SEL sel) {
         return YES;
     } @catch (__unused NSException *e) {
         return NO;
+    }
+}
+
+static BOOL WKSInvokeBoolNoArg(id obj, SEL sel, BOOL fallback) {
+    if (!obj || !sel || ![obj respondsToSelector:sel]) {
+        return fallback;
+    }
+
+    NSMethodSignature *sig = [obj methodSignatureForSelector:sel];
+    if (!sig || sig.numberOfArguments < 2) {
+        return fallback;
+    }
+
+    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+    [inv setTarget:obj];
+    [inv setSelector:sel];
+
+    @try {
+        [inv invoke];
+        BOOL value = fallback;
+        [inv getReturnValue:&value];
+        return value;
+    } @catch (__unused NSException *e) {
+        return fallback;
     }
 }
 
@@ -210,6 +178,26 @@ static id WKSGetPanelHosting(id panel) {
     return nil;
 }
 
+static BOOL WKSIsEnglishPanel(id panel) {
+    Class cls = objc_getClass("WBT26Panel");
+    return (cls && panel && [panel isKindOfClass:cls]);
+}
+
+static long long WKSPanelTryRecognizeSwipeTouch(id self, SEL _cmd, id touch, id keyView,
+                                                 unsigned long long *supportsMoveCursorDirection,
+                                                 BOOL force) {
+    long long result = 0;
+    if (gOrigPanelTryRecognizeSwipeTouch) {
+        result = gOrigPanelTryRecognizeSwipeTouch(self, _cmd, touch, keyView,
+                                                  supportsMoveCursorDirection, force);
+    }
+    // 仅对英文面板阻止进入“全键盘光标移动”方向。
+    if (supportsMoveCursorDirection && WKSIsEnglishPanel(self)) {
+        *supportsMoveCursorDirection = 0;
+    }
+    return result;
+}
+
 static BOOL WKSToggleByHandleLangSwitch(UIView *panel, id host) {
     if (!panel || !host) {
         return NO;
@@ -228,9 +216,6 @@ static BOOL WKSToggleByHandleLangSwitch(UIView *panel, id host) {
 
     long long afterHostType = WKSGetLongLongProperty(host, @selector(currentPanelType), LLONG_MIN);
     long long afterPanelType = WKSGetLongLongProperty(panel, @selector(panelType), LLONG_MIN);
-    WKSDebugEvent(@"toggle",
-                  [NSString stringWithFormat:@"host:%lld->%lld panel:%lld->%lld",
-                   beforeHostType, afterHostType, beforePanelType, afterPanelType]);
 
     if (afterHostType != LLONG_MIN && afterHostType != beforeHostType) {
         WKSInvokeSwitchEngineSession(host, afterHostType);
@@ -243,15 +228,6 @@ static BOOL WKSToggleByHandleLangSwitch(UIView *panel, id host) {
         return YES;
     }
     return YES;
-}
-
-static BOOL WKSToggleInternalMode(id context) {
-    UIView *panel = [context isKindOfClass:[UIView class]] ? (UIView *)context : nil;
-    id host = WKSGetPanelHosting(panel);
-    if (!panel || !host) {
-        return NO;
-    }
-    return WKSToggleByHandleLangSwitch(panel, host);
 }
 
 static BOOL WKSClassNameLooksToolbar(NSString *className) {
@@ -478,8 +454,44 @@ static id WKSGetSymbolListViewFromPanel(id panel) {
     return nil;
 }
 
+static BOOL WKSHostIsAdjustingTextPosition(id host) {
+    if (!host) {
+        return NO;
+    }
+    return WKSInvokeBoolNoArg(host, @selector(isAdjustingTextPosition), NO);
+}
+
+static void WKSAttemptToggleWhenReady(id context, int retries) {
+    UIView *panel = [context isKindOfClass:[UIView class]] ? (UIView *)context : nil;
+    id host = WKSGetPanelHosting(panel);
+    if (!panel || !host) {
+        gWKSInSwitch = NO;
+        return;
+    }
+
+    BOOL adjusting = WKSHostIsAdjustingTextPosition(host);
+    if (adjusting && retries > 0) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                     (int64_t)(kWKSAdjustingRetryDelaySeconds * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            WKSAttemptToggleWhenReady(context, retries - 1);
+        });
+        return;
+    }
+
+    // 超时后不再继续等待，强制执行一次切换，避免英文上下滑“永远失效”。
+    BOOL switched = WKSToggleByHandleLangSwitch(panel, host);
+    if (switched) {
+        gWKSLastSwitchTs = CFAbsoluteTimeGetCurrent();
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                 (int64_t)(kWKSDebounceSeconds * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        gWKSInSwitch = NO;
+    });
+}
+
 static void WKSHandleSwipe(id context) {
-    WKSDebugEvent(@"swipe", nil);
     if (gWKSInSwitch || gWKSSwitchScheduled) {
         return;
     }
@@ -498,51 +510,36 @@ static void WKSHandleSwipe(id context) {
         }
 
         id strongContext = weakContext;
+        if (!strongContext) {
+            return;
+        }
         gWKSInSwitch = YES;
-        gWKSLastSwitchTs = now;
-        WKSToggleInternalMode(strongContext);
-
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                     (int64_t)(kWKSDebounceSeconds * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            gWKSInSwitch = NO;
-        });
+        WKSAttemptToggleWhenReady(strongContext, kWKSAdjustingMaxRetries);
     });
 }
 
-static void WKSInstallGestureIfNeeded(id panelView) {
-    if (!panelView || ![panelView isKindOfClass:[UIView class]]) {
+static void WKSHostAdjustTextPositionNo(id self, SEL _cmd, long long offset) {
+    (void)self;
+    (void)_cmd;
+    (void)offset;
+}
+
+static void WKSHostAdjustTextPositionVerticalNo(id self, SEL _cmd, long long offset) {
+    (void)self;
+    (void)_cmd;
+    (void)offset;
+}
+
+static void WKSEnsureDisableCursorAdjustForHost(id host) {
+    if (!host) {
         return;
     }
-
-    UIView *view = (UIView *)panelView;
-    if (objc_getAssociatedObject(view, &kWKSInstalledKey)) {
-        return;
-    }
-
-    WKSSwipeTarget *target = [WKSSwipeTarget new];
-
-    UISwipeGestureRecognizer *up = [[UISwipeGestureRecognizer alloc] initWithTarget:target
-                                                                              action:@selector(wks_handleSwipe:)];
-    up.direction = UISwipeGestureRecognizerDirectionUp;
-    up.cancelsTouchesInView = NO;
-    up.delaysTouchesBegan = NO;
-    up.delaysTouchesEnded = NO;
-    up.delegate = gWKSGestureDelegate;
-
-    UISwipeGestureRecognizer *down = [[UISwipeGestureRecognizer alloc] initWithTarget:target
-                                                                                action:@selector(wks_handleSwipe:)];
-    down.direction = UISwipeGestureRecognizerDirectionDown;
-    down.cancelsTouchesInView = NO;
-    down.delaysTouchesBegan = NO;
-    down.delaysTouchesEnded = NO;
-    down.delegate = gWKSGestureDelegate;
-
-    [view addGestureRecognizer:up];
-    [view addGestureRecognizer:down];
-
-    objc_setAssociatedObject(view, &kWKSTargetKey, target, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    objc_setAssociatedObject(view, &kWKSInstalledKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    Class cls = [host class];
+    // 仅阻断“实际光标位移执行”，保留原生滑动识别状态机，避免回落到字母确认输入。
+    WKSSwizzleClassMethod(cls, @selector(adjustTextPositionWithOffset:),
+                          (IMP)WKSHostAdjustTextPositionNo, NULL);
+    WKSSwizzleClassMethod(cls, @selector(adjustTextPositionWithVerticalOffset:),
+                          (IMP)WKSHostAdjustTextPositionVerticalNo, NULL);
 }
 
 static void WKSPanelSwipeUp(id self, SEL _cmd, id touch) {
@@ -562,6 +559,18 @@ static void WKSPanelSwipeDown(id self, SEL _cmd, id touch) {
     BOOL shouldHandle = (gWKSSwipeCallbackDepth == 1);
     if (gOrigPanelSwipeDown) {
         gOrigPanelSwipeDown(self, _cmd, touch);
+    }
+    if (shouldHandle) {
+        WKSHandleSwipe(self);
+    }
+    gWKSSwipeCallbackDepth -= 1;
+}
+
+static void WKSPanelSwipeEnded(id self, SEL _cmd, id arg, id touch) {
+    gWKSSwipeCallbackDepth += 1;
+    BOOL shouldHandle = (gWKSSwipeCallbackDepth == 1);
+    if (gOrigPanelSwipeEnded) {
+        gOrigPanelSwipeEnded(self, _cmd, arg, touch);
     }
     if (shouldHandle) {
         WKSHandleSwipe(self);
@@ -621,7 +630,7 @@ static void WKSPanelDidAttachHosting(id self, SEL _cmd) {
     if (gOrigPanelDidAttachHosting) {
         gOrigPanelDidAttachHosting(self, _cmd);
     }
-    WKSInstallGestureIfNeeded(self);
+    WKSEnsureDisableCursorAdjustForHost(WKSGetPanelHosting(self));
     WKSApplyToolbarTransparency(self);
 }
 
@@ -629,7 +638,7 @@ static void WKST9DidAttachHosting(id self, SEL _cmd) {
     if (gOrigT9DidAttachHosting) {
         gOrigT9DidAttachHosting(self, _cmd);
     }
-    WKSInstallGestureIfNeeded(self);
+    WKSEnsureDisableCursorAdjustForHost(WKSGetPanelHosting(self));
     WKSApplyToolbarTransparency(self);
     WKSDisableSymbolListGridFill(WKSGetSymbolListViewFromPanel(self));
 }
@@ -638,7 +647,7 @@ static void WKST26DidAttachHosting(id self, SEL _cmd) {
     if (gOrigT26DidAttachHosting) {
         gOrigT26DidAttachHosting(self, _cmd);
     }
-    WKSInstallGestureIfNeeded(self);
+    WKSEnsureDisableCursorAdjustForHost(WKSGetPanelHosting(self));
     WKSApplyToolbarTransparency(self);
 }
 
@@ -739,10 +748,12 @@ static void WKSSwizzleClassMethod(Class cls, SEL sel, IMP newImp, IMP *oldStore)
 __attribute__((constructor))
 static void WKSInit(void) {
     @autoreleasepool {
-        WKSDebugEvent(@"ctor_begin", nil);
-        gWKSGestureDelegate = [WKSSwipeGestureDelegate new];
-
         Class panel = objc_getClass("WBCommonPanelView");
+        WKSSwizzleClassMethod(panel, @selector(tryRecognizeSwipeTouch:keyView:supportsMoveCursorDirection:force:),
+                              (IMP)WKSPanelTryRecognizeSwipeTouch,
+                              (IMP *)&gOrigPanelTryRecognizeSwipeTouch);
+        WKSSwizzleClassMethod(panel, @selector(processSwipeEnded:touch:),
+                              (IMP)WKSPanelSwipeEnded, (IMP *)&gOrigPanelSwipeEnded);
         WKSSwizzleClassMethod(panel, @selector(processSwipeUpEnded:),
                               (IMP)WKSPanelSwipeUp, (IMP *)&gOrigPanelSwipeUp);
         WKSSwizzleClassMethod(panel, @selector(processSwipeDownEnded:),
@@ -797,6 +808,5 @@ static void WKSInit(void) {
         Class symbolCell = objc_getClass("WBSymbolCell");
         WKSSwizzleClassMethod(symbolCell, @selector(setBorderPosition:),
                               (IMP)WKSSymbolCellSetBorderPosition, (IMP *)&gOrigSymbolCellSetBorderPosition);
-        WKSDebugEvent(@"ctor_end", nil);
     }
 }
