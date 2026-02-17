@@ -1,0 +1,74 @@
+{
+  "symptom": "Dopamine无根越狱环境下插件安装后完全无反应，未被加载到WeType进程",
+  "root_cause": {
+    "file": "control",
+    "line_range": "9-9",
+    "issue": "依赖声明错误：Dopamine使用Substitute框架而非MobileSubstrate。control文件声明了mobilesubstrate依赖，导致插件无法被Substitute正确加载注入",
+    "confidence": 0.95
+  },
+  "affected_files": [
+    {
+      "path": "/root/wxkb/WeChatKeyboardSwitch/control",
+      "relevance": 0.95,
+      "rationale": "依赖声明错误，需要将mobilesubstrate改为com.ex.substitute (>= 2.0)"
+    },
+    {
+      "path": "/root/wxkb/WeChatKeyboardSwitch/Makefile",
+      "relevance": 0.70,
+      "rationale": "构建配置正确（THEOS_PACKAGE_SCHEME=rootless已设置），但缺少ldid签名步骤"
+    },
+    {
+      "path": "/root/wxkb/WeChatKeyboardSwitch/.theos/obj/debug/arm64/WeChatKeyboardSwitch.dylib",
+      "relevance": 0.60,
+      "rationale": "dylib未签名，可能在某些iOS版本被拒绝加载"
+    },
+    {
+      "path": "/root/wxkb/WeChatKeyboardSwitch/WeChatKeyboardSwitch.plist",
+      "relevance": 0.50,
+      "rationale": "过滤器配置正确（com.tencent.wetype），无需修改"
+    }
+  ],
+  "reproduction_steps": [
+    "1. 在Dopamine无根越狱环境（iOS 15-16）安装插件deb包",
+    "2. 重启SpringBoard或目标应用WeType",
+    "3. 插件dylib未被Substitute注入到WeType进程",
+    "4. 使用ps命令或Filza检查进程，确认dylib未加载",
+    "5. 检查/var/jb/Library/MobileSubstrate/DynamicLibraries/目录，文件存在但未生效"
+  ],
+  "fix_hints": [
+    "【关键修复】修改control文件第9行：将'Depends: mobilesubstrate (>= 0.9.5000)'改为'Depends: com.ex.substitute (>= 2.0)'",
+    "【推荐】在Makefile中添加签名步骤：在第16行后添加'after-install:: $(ECHO_NOTHING)ldid -S $(THEOS_STAGING_DIR)/var/jb/Library/MobileSubstrate/DynamicLibraries/WeChatKeyboardSwitch.dylib$(ECHO_END)'",
+    "【验证】重新编译：make clean && make package FINALPACKAGE=1",
+    "【测试】在Dopamine设备上安装新deb包，使用'killall -9 WeType'重启应用",
+    "【调试】如仍无效，检查系统日志：'log stream --predicate \"process == \\\"WeType\\\"\" --level debug'"
+  ],
+  "dependencies": [
+    "Dopamine无根越狱环境（iOS 15.0-16.6.1）",
+    "Substitute注入框架（com.ex.substitute >= 2.0）",
+    "THEOS构建系统（已配置rootless支持）",
+    "目标应用WeType（com.tencent.wetype）"
+  ],
+  "constraints": [
+    "无根越狱限制：所有文件必须安装到/var/jb/前缀路径",
+    "Substitute框架限制：不兼容MobileSubstrate的某些API",
+    "iOS 15-16兼容性：需要arm64架构和iOS 13.0+部署目标",
+    "代码签名要求：dylib需要ad-hoc签名（ldid -S）",
+    "进程注入限制：仅注入到plist中Filter.Bundles指定的应用"
+  ],
+  "clarification_needs": [],
+  "_metadata": {
+    "diagnosis_angle": "runtime-environment",
+    "diagnosis_index": 3,
+    "timestamp": "2025-12-13T03:55:00Z",
+    "analysis_method": "bash-structural-scan",
+    "key_findings": [
+      "Makefile配置正确：THEOS_PACKAGE_SCHEME=rootless已设置",
+      "输出路径正确：.theos/_/var/jb/Library/MobileSubstrate/DynamicLibraries/",
+      "依赖声明错误：control文件声明mobilesubstrate而非substitute",
+      "dylib架构正确：Mach-O 64-bit arm64 dynamically linked shared library",
+      "plist过滤器正确：Filter.Bundles包含com.tencent.wetype",
+      "缺少代码签名：构建环境未安装ldid工具"
+    ],
+    "confidence_rationale": "通过检查Makefile、control、dylib属性和安装路径，确认根本原因是依赖声明错误。Dopamine明确要求使用com.ex.substitute而非mobilesubstrate，这是导致插件无法加载的直接原因。置信度95%。"
+  }
+}

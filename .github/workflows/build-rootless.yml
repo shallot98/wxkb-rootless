@@ -1,0 +1,67 @@
+name: Build Rootless
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build-rootless:
+    runs-on: ubuntu-22.04
+    env:
+      THEOS: ${{ github.workspace }}/theos
+      TARGET: iphone:clang:13.7:14.0
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            fakeroot \
+            git \
+            perl \
+            xz-utils \
+            lzma \
+            zip \
+            unzip \
+            curl
+
+      - name: Cache Theos
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ github.workspace }}/theos
+          key: theos-${{ runner.os }}-v1
+
+      - name: Setup Theos
+        run: |
+          if [ ! -d "$THEOS/.git" ]; then
+            git clone --recursive https://github.com/theos/theos.git "$THEOS"
+          else
+            git -C "$THEOS" pull --ff-only
+            git -C "$THEOS" submodule update --init --recursive
+          fi
+
+      - name: Build rootless arm64 package
+        run: |
+          make clean package \
+            THEOS_PACKAGE_SCHEME=rootless \
+            ARCHS=arm64 \
+            FINALPACKAGE=1 \
+            PACKAGE_VERSION=1.0.0-ci.${{ github.run_number }}
+
+      - name: Upload DEB Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rootless-arm64-deb
+          path: packages/*.deb
+          if-no-files-found: error
+

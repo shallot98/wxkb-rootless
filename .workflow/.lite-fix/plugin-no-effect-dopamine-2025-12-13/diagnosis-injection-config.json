@@ -1,0 +1,59 @@
+{
+  "symptom": "插件安装后完全无反应，上下滑动手势无效果",
+  "root_cause": {
+    "file": "WeChatKeyboardSwitch.plist",
+    "line_range": "1-2",
+    "issue": "plist文件权限设置为600（-rw-------），导致MobileSubstrate/Substitute无法读取该文件。在iOS系统中，SpringBoard和目标进程需要读取plist文件来确定dylib注入目标，但当前权限只允许root用户读取，导致注入机制完全失效。正确权限应为644（-rw-r--r--）以允许系统进程读取。",
+    "confidence": 0.95
+  },
+  "affected_files": [
+    {
+      "path": "/var/jb/Library/MobileSubstrate/DynamicLibraries/WeChatKeyboardSwitch.plist",
+      "relevance": 0.98,
+      "rationale": "注入配置文件，权限错误（600而非644）导致MobileSubstrate无法读取，是插件无法加载的直接原因"
+    },
+    {
+      "path": "/var/jb/Library/MobileSubstrate/DynamicLibraries/WeChatKeyboardSwitch.dylib",
+      "relevance": 0.85,
+      "rationale": "插件动态库文件，权限正确（755），但由于plist无法被读取而无法被注入"
+    },
+    {
+      "path": "/root/wxkb/WeChatKeyboardSwitch/Makefile",
+      "relevance": 0.75,
+      "rationale": "构建配置文件，需要添加plist文件权限设置规则"
+    }
+  ],
+  "reproduction_steps": [
+    "1. 安装deb包: dpkg -i com.yourname.wechatkeyboardswitch_1.0.0-2+debug_iphoneos-arm64.deb",
+    "2. 检查plist权限: ls -la /var/jb/Library/MobileSubstrate/DynamicLibraries/WeChatKeyboardSwitch.plist",
+    "3. 观察权限为 -rw------- (600)，系统进程无法读取",
+    "4. 重启微信输入法: killall -9 WeType",
+    "5. 打开任意应用，调出微信输入法",
+    "6. 尝试上下滑动 - 无反应（因为dylib未被注入）"
+  ],
+  "fix_hints": [
+    "在Makefile中添加after-install规则，设置plist文件权限为644",
+    "添加规则: after-install:: \n\t$(ECHO_NOTHING)chmod 644 $(THEOS_STAGING_DIR)/var/jb/Library/MobileSubstrate/DynamicLibraries/$(TWEAK_NAME).plist$(ECHO_END)",
+    "重新编译并打包: make clean && make package",
+    "重新安装deb包并验证权限: ls -la /var/jb/Library/MobileSubstrate/DynamicLibraries/WeChatKeyboardSwitch.plist",
+    "确认权限变更为 -rw-r--r-- (644) 后重启SpringBoard或目标进程"
+  ],
+  "dependencies": [
+    "mobilesubstrate (>= 0.9.5000)",
+    "Dopamine越狱环境",
+    "正确的文件权限配置"
+  ],
+  "constraints": [
+    "无根越狱环境限制（需使用/var/jb路径）",
+    "plist文件必须可被系统进程读取（权限644）",
+    "Bundle ID必须精确匹配目标应用（com.tencent.wetype）"
+  ],
+  "clarification_needs": [],
+  "_metadata": {
+    "diagnosis_angle": "injection-config",
+    "diagnosis_index": 1,
+    "timestamp": "2025-12-13T03:55:00Z",
+    "discovered_via": "bash-dpkg-analysis",
+    "verification_command": "dpkg-deb --contents *.deb | grep plist"
+  }
+}

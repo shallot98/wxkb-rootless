@@ -1,0 +1,67 @@
+{
+  "symptom": "Hook代码编译成功但运行时不生效，手势滑动无响应",
+  "root_cause": {
+    "file": "Tweak.x",
+    "line_range": "15-18",
+    "issue": "前向声明中的父类错误：WBCommonPanelView被声明为继承自UIView，但实际应继承自WBTransitionView。这导致运行时类型不匹配，CydiaSubstrate无法正确识别和Hook目标类，因为类层次结构验证失败。完整继承链应为：WBCommonPanelView -> WBTransitionView -> WBBaseView -> UIView",
+    "confidence": 0.95
+  },
+  "affected_files": [
+    {
+      "path": "Tweak.x",
+      "relevance": 0.95,
+      "rationale": "Hook实现代码，第15行错误声明了WBCommonPanelView的父类为UIView而非WBTransitionView"
+    },
+    {
+      "path": "Headers/WBCommonPanelView.h",
+      "relevance": 0.90,
+      "rationale": "目标类的正确定义，第16行显示WBCommonPanelView继承自WBTransitionView"
+    },
+    {
+      "path": "Headers/WBTransitionView.h",
+      "relevance": 0.75,
+      "rationale": "中间父类定义，继承自WBBaseView，包含状态管理和生命周期方法"
+    },
+    {
+      "path": "Headers/WBBaseView.h",
+      "relevance": 0.60,
+      "rationale": "基础父类定义，继承自UIView，是完整类层次结构的一部分"
+    }
+  ],
+  "reproduction_steps": [
+    "1. 编译插件: make package",
+    "2. 安装到Dopamine无根越狱设备",
+    "3. 重启WeType键盘进程",
+    "4. 在键盘上执行上滑或下滑手势",
+    "5. 观察到手势无响应，NSLog日志中没有Hook触发的消息",
+    "6. 原因：CydiaSubstrate在运行时验证类层次结构时发现不匹配，拒绝应用Hook"
+  ],
+  "fix_hints": [
+    "修改Tweak.x第15行，将@interface WBCommonPanelView : UIView改为@interface WBCommonPanelView : WBTransitionView",
+    "或者完全移除前向声明，直接导入完整头文件：#import \"Headers/WBCommonPanelView.h\"",
+    "推荐方案：导入完整头文件以确保类型信息完整，避免运行时类型不匹配",
+    "验证修复：重新编译后检查syslog中是否出现[WeChatKeyboardSwitch] Swipe up/down detected日志"
+  ],
+  "dependencies": [
+    "WBCommonPanelView类（继承自WBTransitionView）",
+    "WBTransitionView类（继承自WBBaseView）",
+    "WBBaseView类（继承自UIView）",
+    "CydiaSubstrate Hook机制",
+    "运行时类型验证机制"
+  ],
+  "constraints": [
+    "运行时类层次结构必须与声明一致",
+    "CydiaSubstrate要求前向声明的父类与实际父类匹配",
+    "方法签名必须与头文件定义完全一致",
+    "Dopamine无根越狱环境下的动态库加载路径"
+  ],
+  "clarification_needs": [],
+  "_metadata": {
+    "diagnosis_angle": "hook-implementation",
+    "diagnosis_index": 2,
+    "timestamp": "2025-12-13T03:55:00Z",
+    "analyzer": "claude-sonnet-4.5",
+    "confidence_level": "high",
+    "verification_method": "class-hierarchy-analysis"
+  }
+}

@@ -1,0 +1,14 @@
+.theos/
+packages/
+*.deb
+
+.DS_Store
+*.swp
+*.swo
+
+*.bak
+*.tmp
+
+Tweak.x.bak.*
+Tweak.x.temp-*
+

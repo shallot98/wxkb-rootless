@@ -1,0 +1,9 @@
+Package: com.yourname.wechatkeyboardswitch
+Name: WeChatKeyboardSwitch
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Description: 微信输入法键盘滑动切换中英文插件，支持 rootless / roothide
+Maintainer: Your Name <your.email@example.com>
+Author: Your Name <your.email@example.com>
+Section: Tweaks
+Depends: mobilesubstrate | ellekit | libhooker
