@@ -2,48 +2,16 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <limits.h>
-#include <unistd.h>
 
 static BOOL gWKSInSwitch = NO;
 static BOOL gWKSSwitchScheduled = NO;
 static CFAbsoluteTime gWKSLastSwitchTs = 0;
 static int gWKSSwipeCallbackDepth = 0;
+static const BOOL kWKSEnableSwipeSwitch = NO;
 
 static const NSTimeInterval kWKSDebounceSeconds = 0.25;
 static const NSTimeInterval kWKSScheduleDelaySeconds = 0.25;
 static const NSTimeInterval kWKSSwitchCooldownSeconds = 0.45;
-
-static void WKSDebugEvent(NSString *event, NSString *detail) {
-    @autoreleasepool {
-        NSString *tmp = NSTemporaryDirectory();
-        if (tmp.length == 0) {
-            tmp = @"/tmp";
-        }
-        NSString *path = [tmp stringByAppendingPathComponent:@"wks_inject_marker.log"];
-        NSString *line = [NSString stringWithFormat:@"%.3f pid=%d %@ %@\n",
-                          CFAbsoluteTimeGetCurrent(),
-                          getpid(),
-                          event ?: @"event",
-                          detail ?: @""];
-        NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
-        NSFileManager *fm = [NSFileManager defaultManager];
-        if (![fm fileExistsAtPath:path]) {
-            [data writeToFile:path atomically:YES];
-            return;
-        }
-        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
-        if (!fh) {
-            [data writeToFile:path atomically:YES];
-            return;
-        }
-        @try {
-            [fh seekToEndOfFile];
-            [fh writeData:data];
-            [fh closeFile];
-        } @catch (__unused NSException *e) {
-        }
-    }
-}
 
 static void (*gOrigPanelSwipeUp)(id, SEL, id) = NULL;
 static void (*gOrigPanelSwipeDown)(id, SEL, id) = NULL;
@@ -228,10 +196,6 @@ static BOOL WKSToggleByHandleLangSwitch(UIView *panel, id host) {
 
     long long afterHostType = WKSGetLongLongProperty(host, @selector(currentPanelType), LLONG_MIN);
     long long afterPanelType = WKSGetLongLongProperty(panel, @selector(panelType), LLONG_MIN);
-    WKSDebugEvent(@"toggle",
-                  [NSString stringWithFormat:@"host:%lld->%lld panel:%lld->%lld",
-                   beforeHostType, afterHostType, beforePanelType, afterPanelType]);
-
     if (afterHostType != LLONG_MIN && afterHostType != beforeHostType) {
         WKSInvokeSwitchEngineSession(host, afterHostType);
     }
@@ -479,7 +443,9 @@ static id WKSGetSymbolListViewFromPanel(id panel) {
 }
 
 static void WKSHandleSwipe(id context) {
-    WKSDebugEvent(@"swipe", nil);
+    if (!kWKSEnableSwipeSwitch) {
+        return;
+    }
     if (gWKSInSwitch || gWKSSwitchScheduled) {
         return;
     }
@@ -511,6 +477,9 @@ static void WKSHandleSwipe(id context) {
 }
 
 static void WKSInstallGestureIfNeeded(id panelView) {
+    if (!kWKSEnableSwipeSwitch) {
+        return;
+    }
     if (!panelView || ![panelView isKindOfClass:[UIView class]]) {
         return;
     }
@@ -739,30 +708,37 @@ static void WKSSwizzleClassMethod(Class cls, SEL sel, IMP newImp, IMP *oldStore)
 __attribute__((constructor))
 static void WKSInit(void) {
     @autoreleasepool {
-        WKSDebugEvent(@"ctor_begin", nil);
-        gWKSGestureDelegate = [WKSSwipeGestureDelegate new];
+        if (kWKSEnableSwipeSwitch) {
+            gWKSGestureDelegate = [WKSSwipeGestureDelegate new];
+        }
 
         Class panel = objc_getClass("WBCommonPanelView");
-        WKSSwizzleClassMethod(panel, @selector(processSwipeUpEnded:),
-                              (IMP)WKSPanelSwipeUp, (IMP *)&gOrigPanelSwipeUp);
-        WKSSwizzleClassMethod(panel, @selector(processSwipeDownEnded:),
-                              (IMP)WKSPanelSwipeDown, (IMP *)&gOrigPanelSwipeDown);
+        if (kWKSEnableSwipeSwitch) {
+            WKSSwizzleClassMethod(panel, @selector(processSwipeUpEnded:),
+                                  (IMP)WKSPanelSwipeUp, (IMP *)&gOrigPanelSwipeUp);
+            WKSSwizzleClassMethod(panel, @selector(processSwipeDownEnded:),
+                                  (IMP)WKSPanelSwipeDown, (IMP *)&gOrigPanelSwipeDown);
+        }
         WKSSwizzleClassMethod(panel, @selector(didAttachHosting),
                               (IMP)WKSPanelDidAttachHosting, (IMP *)&gOrigPanelDidAttachHosting);
 
         Class t9 = objc_getClass("WBT9Panel");
-        WKSSwizzleClassMethod(t9, @selector(processSwipeUpEnded:),
-                              (IMP)WKST9SwipeUp, (IMP *)&gOrigT9SwipeUp);
-        WKSSwizzleClassMethod(t9, @selector(processSwipeDownEnded:),
-                              (IMP)WKST9SwipeDown, (IMP *)&gOrigT9SwipeDown);
+        if (kWKSEnableSwipeSwitch) {
+            WKSSwizzleClassMethod(t9, @selector(processSwipeUpEnded:),
+                                  (IMP)WKST9SwipeUp, (IMP *)&gOrigT9SwipeUp);
+            WKSSwizzleClassMethod(t9, @selector(processSwipeDownEnded:),
+                                  (IMP)WKST9SwipeDown, (IMP *)&gOrigT9SwipeDown);
+        }
         WKSSwizzleClassMethod(t9, @selector(didAttachHosting),
                               (IMP)WKST9DidAttachHosting, (IMP *)&gOrigT9DidAttachHosting);
 
         Class t26 = objc_getClass("WBT26Panel");
-        WKSSwizzleClassMethod(t26, @selector(processSwipeUpEnded:),
-                              (IMP)WKST26SwipeUp, (IMP *)&gOrigT26SwipeUp);
-        WKSSwizzleClassMethod(t26, @selector(processSwipeDownEnded:),
-                              (IMP)WKST26SwipeDown, (IMP *)&gOrigT26SwipeDown);
+        if (kWKSEnableSwipeSwitch) {
+            WKSSwizzleClassMethod(t26, @selector(processSwipeUpEnded:),
+                                  (IMP)WKST26SwipeUp, (IMP *)&gOrigT26SwipeUp);
+            WKSSwizzleClassMethod(t26, @selector(processSwipeDownEnded:),
+                                  (IMP)WKST26SwipeDown, (IMP *)&gOrigT26SwipeDown);
+        }
         WKSSwizzleClassMethod(t26, @selector(didAttachHosting),
                               (IMP)WKST26DidAttachHosting, (IMP *)&gOrigT26DidAttachHosting);
 
@@ -797,6 +773,5 @@ static void WKSInit(void) {
         Class symbolCell = objc_getClass("WBSymbolCell");
         WKSSwizzleClassMethod(symbolCell, @selector(setBorderPosition:),
                               (IMP)WKSSymbolCellSetBorderPosition, (IMP *)&gOrigSymbolCellSetBorderPosition);
-        WKSDebugEvent(@"ctor_end", nil);
     }
 }
