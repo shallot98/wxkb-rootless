@@ -24,11 +24,16 @@ static const NSTimeInterval kWKSSwitchCooldownSeconds = 0.12;
 static const NSTimeInterval kWKSAdjustingRetryDelaySeconds = 0.06;
 static const NSTimeInterval kWKSSwitchApplyDelaySeconds = 0.08;
 static const int kWKSAdjustingMaxRetries = 10;
-static const CGFloat kWKSTextUpMoveTriggerDistance = 12.0;
-static const CGFloat kWKSTextUpMoveMaxHorizontal = 44.0;
-static const CGFloat kWKSTextUpCancelTriggerDistance = 4.0;
+static const CGFloat kWKSTextUpMoveTriggerDistance = 18.0;
+static const CGFloat kWKSTextUpMoveMaxHorizontal = 20.0;
+static const CGFloat kWKSTextUpCancelTriggerDistance = 24.0;
+static const CGFloat kWKSTextUpVerticalRatio = 1.80;
+static const CGFloat kWKSTextUpKeyTopMargin = 3.0;
+static const NSTimeInterval kWKSTextUpMinGestureAgeSeconds = 0.07;
 static const NSTimeInterval kWKSTextUpStateTTLSeconds = 0.80;
 static const NSTimeInterval kWKSRecentMoveTriggerTTLSeconds = 0.35;
+static const CGFloat kWKSHorizontalBlockMinDistance = 10.0;
+static const CGFloat kWKSHorizontalBlockRatio = 1.20;
 
 static void (*gOrigPanelSwipeUp)(id, SEL, id) = NULL;
 static void (*gOrigPanelSwipeDown)(id, SEL, id) = NULL;
@@ -36,8 +41,11 @@ static void (*gOrigPanelSwipeEnded)(id, SEL, id, id) = NULL;
 static void (*gOrigPanelAnySwipeBegan)(id, SEL, id, id) = NULL;
 static void (*gOrigPanelAnySwipeMoved)(id, SEL, id, id) = NULL;
 static void (*gOrigPanelTouchesCancelled)(id, SEL, id, id) = NULL;
+static void (*gOrigPanelProcessTouchBegan)(id, SEL, id, id) = NULL;
 static void (*gOrigPanelProcessTouchMoved)(id, SEL, id, id) = NULL;
 static void (*gOrigPanelProcessTouchCancel)(id, SEL, id, id) = NULL;
+static void (*gOrigPanelProcessTouchEnd)(id, SEL, id, id) = NULL;
+static void (*gOrigPanelProcessTouchEndWithInterrupter)(id, SEL, id, id, id) = NULL;
 static void (*gOrigPanelSwipeUpBegan)(id, SEL, id, id, BOOL) = NULL;
 static void (*gOrigPanelSwipeUpMoved)(id, SEL, id, id) = NULL;
 static void (*gOrigT9SwipeUp)(id, SEL, id) = NULL;
@@ -67,6 +75,11 @@ static void (*gOrigSymbolCellSetBorderPosition)(id, SEL, unsigned long long) = N
 static void WKSHandleSwipe(id context);
 static void WKSAttemptToggleWhenReady(id context, int retries);
 static void WKSSwizzleClassMethod(Class cls, SEL sel, IMP newImp, IMP *oldStore);
+
+static const void *kWKSTouchStartPointAssocKey = &kWKSTouchStartPointAssocKey;
+static const void *kWKSTouchKeepNativeSwipeAssocKey = &kWKSTouchKeepNativeSwipeAssocKey;
+static const void *kWKSTouchSwitchTriggeredAssocKey = &kWKSTouchSwitchTriggeredAssocKey;
+static const void *kWKSTouchHorizontalBlockedAssocKey = &kWKSTouchHorizontalBlockedAssocKey;
 
 static BOOL WKSInvokeLongLongGetter(id obj, SEL sel, long long *outValue) {
     if (!obj || !sel || !outValue || ![obj respondsToSelector:sel]) {
@@ -136,6 +149,32 @@ static BOOL WKSInvokeBoolNoArg(id obj, SEL sel, BOOL fallback) {
     NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
     [inv setTarget:obj];
     [inv setSelector:sel];
+
+    @try {
+        [inv invoke];
+        BOOL value = fallback;
+        [inv getReturnValue:&value];
+        return value;
+    } @catch (__unused NSException *e) {
+        return fallback;
+    }
+}
+
+static BOOL WKSInvokeBoolWithObject(id obj, SEL sel, id arg, BOOL fallback) {
+    if (!obj || !sel || ![obj respondsToSelector:sel]) {
+        return fallback;
+    }
+
+    NSMethodSignature *sig = [obj methodSignatureForSelector:sel];
+    if (!sig || sig.numberOfArguments < 3) {
+        return fallback;
+    }
+
+    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+    [inv setTarget:obj];
+    [inv setSelector:sel];
+    id argObj = arg;
+    [inv setArgument:&argObj atIndex:2];
 
     @try {
         [inv invoke];
@@ -225,6 +264,27 @@ static BOOL WKSStringLooksSpaceKey(NSString *value) {
            [text containsString:@"空格"];
 }
 
+static BOOL WKSStringLooksDeleteKey(NSString *value) {
+    if (value.length == 0) {
+        return NO;
+    }
+    NSString *text = [value stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (text.length == 0) {
+        return NO;
+    }
+    NSString *lower = text.lowercaseString;
+    return [lower isEqualToString:@"delete"] ||
+           [lower isEqualToString:@"backspace"] ||
+           [text isEqualToString:@"删除"] ||
+           [text isEqualToString:@"退格"] ||
+           [lower containsString:@"delete"] ||
+           [lower containsString:@"backspace"] ||
+           [text containsString:@"删除"] ||
+           [text containsString:@"退格"] ||
+           [text containsString:@"⌫"] ||
+           [text containsString:@"←"];
+}
+
 static NSString *WKSStringForKVC(id obj, NSString *key) {
     if (!obj || key.length == 0) {
         return nil;
@@ -289,6 +349,127 @@ static BOOL WKSGetTouchLocationInPanel(id touchArg, id panel, CGPoint *outPoint)
     }
 }
 
+static void WKSSetTouchStartPoint(id touchArg, CGPoint point) {
+    id touchLike = WKSExtractTouchLikeObject(touchArg);
+    if (!touchLike) {
+        return;
+    }
+    @try {
+        objc_setAssociatedObject(touchLike, kWKSTouchStartPointAssocKey,
+                                 [NSValue valueWithCGPoint:point],
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    } @catch (__unused NSException *e) {
+    }
+}
+
+static BOOL WKSGetTouchStartPoint(id touchArg, CGPoint *outPoint) {
+    id touchLike = WKSExtractTouchLikeObject(touchArg);
+    if (!touchLike) {
+        return NO;
+    }
+    @try {
+        id value = objc_getAssociatedObject(touchLike, kWKSTouchStartPointAssocKey);
+        if ([value isKindOfClass:[NSValue class]]) {
+            if (outPoint) {
+                *outPoint = [(NSValue *)value CGPointValue];
+            }
+            return YES;
+        }
+    } @catch (__unused NSException *e) {
+    }
+    return NO;
+}
+
+static void WKSSetTouchKeepNativeSwipe(id touchArg, BOOL keepNative) {
+    id touchLike = WKSExtractTouchLikeObject(touchArg);
+    if (!touchLike) {
+        return;
+    }
+    @try {
+        objc_setAssociatedObject(touchLike, kWKSTouchKeepNativeSwipeAssocKey,
+                                 @(keepNative), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    } @catch (__unused NSException *e) {
+    }
+}
+
+static BOOL WKSGetTouchKeepNativeSwipe(id touchArg, BOOL *outKeepNative) {
+    id touchLike = WKSExtractTouchLikeObject(touchArg);
+    if (!touchLike) {
+        return NO;
+    }
+    @try {
+        id value = objc_getAssociatedObject(touchLike, kWKSTouchKeepNativeSwipeAssocKey);
+        if ([value isKindOfClass:[NSNumber class]]) {
+            if (outKeepNative) {
+                *outKeepNative = [(NSNumber *)value boolValue];
+            }
+            return YES;
+        }
+    } @catch (__unused NSException *e) {
+    }
+    return NO;
+}
+
+static void WKSSetTouchSwitchTriggered(id touchArg, BOOL triggered) {
+    id touchLike = WKSExtractTouchLikeObject(touchArg);
+    if (!touchLike) {
+        return;
+    }
+    @try {
+        objc_setAssociatedObject(touchLike, kWKSTouchSwitchTriggeredAssocKey,
+                                 @(triggered), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    } @catch (__unused NSException *e) {
+    }
+}
+
+static BOOL WKSGetTouchSwitchTriggered(id touchArg, BOOL *outTriggered) {
+    id touchLike = WKSExtractTouchLikeObject(touchArg);
+    if (!touchLike) {
+        return NO;
+    }
+    @try {
+        id value = objc_getAssociatedObject(touchLike, kWKSTouchSwitchTriggeredAssocKey);
+        if ([value isKindOfClass:[NSNumber class]]) {
+            if (outTriggered) {
+                *outTriggered = [(NSNumber *)value boolValue];
+            }
+            return YES;
+        }
+    } @catch (__unused NSException *e) {
+    }
+    return NO;
+}
+
+static void WKSSetTouchHorizontalBlocked(id touchArg, BOOL blocked) {
+    id touchLike = WKSExtractTouchLikeObject(touchArg);
+    if (!touchLike) {
+        return;
+    }
+    @try {
+        objc_setAssociatedObject(touchLike, kWKSTouchHorizontalBlockedAssocKey,
+                                 @(blocked), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    } @catch (__unused NSException *e) {
+    }
+}
+
+static BOOL WKSGetTouchHorizontalBlocked(id touchArg, BOOL *outBlocked) {
+    id touchLike = WKSExtractTouchLikeObject(touchArg);
+    if (!touchLike) {
+        return NO;
+    }
+    @try {
+        id value = objc_getAssociatedObject(touchLike, kWKSTouchHorizontalBlockedAssocKey);
+        if ([value isKindOfClass:[NSNumber class]]) {
+            if (outBlocked) {
+                *outBlocked = [(NSNumber *)value boolValue];
+            }
+            return YES;
+        }
+    } @catch (__unused NSException *e) {
+    }
+    return NO;
+}
+
 static id WKSGetSwipeKeyView(id panel, id swipeArg) {
     id obj = WKSExtractTouchLikeObject(swipeArg);
     id keyView = WKSFindKeyViewFromView(obj);
@@ -348,12 +529,124 @@ static BOOL WKSIsSpaceKeyView(id keyView) {
     return NO;
 }
 
+static BOOL WKSIsDeleteKeyView(id keyView) {
+    if (!keyView) {
+        return NO;
+    }
+
+    NSArray<NSString *> *directKeys = @[@"defaultTitle", @"defaultInputForNormalState"];
+    for (NSString *key in directKeys) {
+        if (WKSStringLooksDeleteKey(WKSStringForKVC(keyView, key))) {
+            return YES;
+        }
+    }
+
+    id item = nil;
+    @try {
+        item = [keyView valueForKey:@"item"];
+    } @catch (__unused NSException *e) {
+    }
+    NSArray<NSString *> *itemKeys = @[@"identifier", @"title", @"input", @"upInput"];
+    for (NSString *key in itemKeys) {
+        if (WKSStringLooksDeleteKey(WKSStringForKVC(item, key))) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+static BOOL WKSPanelIsDeleteKeyView(id panel, id keyView) {
+    if (WKSIsDeleteKeyView(keyView)) {
+        return YES;
+    }
+    if (!panel || !keyView) {
+        return NO;
+    }
+
+    id deleteManager = nil;
+    @try {
+        deleteManager = [panel valueForKey:@"_deleteManager"];
+    } @catch (__unused NSException *e) {
+    }
+    if (!deleteManager) {
+        @try {
+            deleteManager = [panel valueForKey:@"deleteManager"];
+        } @catch (__unused NSException *e) {
+        }
+    }
+    if (!deleteManager) {
+        return NO;
+    }
+
+    if (WKSInvokeBoolWithObject(deleteManager, @selector(checkDetectSwipeDelete:), keyView, NO)) {
+        return YES;
+    }
+
+    @try {
+        id detectingKeyView = [deleteManager valueForKey:@"detectingSwipeKeyView"];
+        if (detectingKeyView == keyView) {
+            return YES;
+        }
+    } @catch (__unused NSException *e) {
+    }
+    @try {
+        id managerKeyView = [deleteManager valueForKey:@"keyView"];
+        if (managerKeyView == keyView) {
+            return YES;
+        }
+    } @catch (__unused NSException *e) {
+    }
+    return NO;
+}
+
+static void WKSPrimeTouchKeepNativeSwipeFromArg(id panel, id swipeArg) {
+    if (!panel || !swipeArg) {
+        return;
+    }
+    id keyView = WKSGetSwipeKeyView(panel, swipeArg);
+    if (!keyView) {
+        return;
+    }
+    BOOL keepNative = WKSIsSpaceKeyView(keyView) || WKSPanelIsDeleteKeyView(panel, keyView);
+    WKSSetTouchKeepNativeSwipe(swipeArg, keepNative);
+}
+
 static BOOL WKSShouldKeepNativeSpaceSwipe(id panel, id swipeArg) {
-    return WKSIsSpaceKeyView(WKSGetSwipeKeyView(panel, swipeArg));
+    WKSPrimeTouchKeepNativeSwipeFromArg(panel, swipeArg);
+    BOOL keepNative = NO;
+    if (WKSGetTouchKeepNativeSwipe(swipeArg, &keepNative)) {
+        return keepNative;
+    }
+    id keyView = WKSGetSwipeKeyView(panel, swipeArg);
+    return WKSIsSpaceKeyView(keyView) || WKSPanelIsDeleteKeyView(panel, keyView);
+}
+
+static BOOL WKSShouldIgnoreDeleteSwipe(id panel, id swipeArg) {
+    (void)panel;
+    (void)swipeArg;
+    return NO;
 }
 
 static BOOL WKSPanelShouldUseTextUpMoveMode(id panel, id swipeArg) {
     return (panel && !WKSShouldKeepNativeSpaceSwipe(panel, swipeArg));
+}
+
+static BOOL WKSIsPredominantlyHorizontalSwipe(id panel, id swipeArg) {
+    if (!panel) {
+        return NO;
+    }
+    CGPoint startPoint = CGPointZero;
+    CGPoint currentPoint = CGPointZero;
+    if (!WKSGetTouchStartPoint(swipeArg, &startPoint) ||
+        !WKSGetTouchLocationInPanel(swipeArg, panel, &currentPoint)) {
+        return NO;
+    }
+    CGFloat dx = currentPoint.x - startPoint.x;
+    CGFloat dy = currentPoint.y - startPoint.y;
+    CGFloat absDx = (CGFloat)fabs(dx);
+    CGFloat absDy = (CGFloat)fabs(dy);
+    return (absDx >= kWKSHorizontalBlockMinDistance &&
+            absDx > (absDy * kWKSHorizontalBlockRatio));
 }
 
 static void WKSClearTextUpMoveState(void) {
@@ -378,6 +671,9 @@ static void WKSArmTextUpMoveState(id panel, id swipeArg) {
     gWKSTextUpTouchAddr = WKSAddressForTouchArg(swipeArg);
     gWKSTextUpArmedTs = CFAbsoluteTimeGetCurrent();
     gWKSTextUpHasStartPoint = WKSGetTouchLocationInPanel(swipeArg, panel, &gWKSTextUpStartPoint);
+    if (gWKSTextUpHasStartPoint) {
+        WKSSetTouchStartPoint(swipeArg, gWKSTextUpStartPoint);
+    }
 }
 
 static BOOL WKSTextUpMoveTouchMatches(id swipeArg) {
@@ -433,6 +729,30 @@ static void WKSHandleTextUpSwipeBegan(id panel, id swipeArg) {
     }
 }
 
+static BOOL WKSIsValidUpSwipeDelta(CGFloat dy, CGFloat dx, CGFloat minDistance, CGFloat maxHorizontal) {
+    if (dy > -minDistance) {
+        return NO;
+    }
+    CGFloat absDx = (CGFloat)fabs(dx);
+    if (absDx > maxHorizontal) {
+        return NO;
+    }
+    CGFloat absDy = (CGFloat)fabs(dy);
+    return (absDy >= absDx * kWKSTextUpVerticalRatio);
+}
+
+static BOOL WKSIsValidUpSwipeKeyPosition(id panel, id swipeArg, CGPoint startPoint, CGPoint currentPoint) {
+    id keyView = WKSGetSwipeKeyView(panel, swipeArg);
+    if (!keyView || ![keyView isKindOfClass:[UIView class]]) {
+        return NO;
+    }
+    CGRect keyFrame = ((UIView *)keyView).frame;
+    if (!CGRectContainsPoint(keyFrame, startPoint)) {
+        return NO;
+    }
+    return (currentPoint.y <= (CGRectGetMinY(keyFrame) - kWKSTextUpKeyTopMargin));
+}
+
 static void WKSTryHandleTextUpSwipeMoved(id panel, id swipeArg) {
     if (!panel) {
         return;
@@ -452,6 +772,9 @@ static void WKSTryHandleTextUpSwipeMoved(id panel, id swipeArg) {
         WKSClearTextUpMoveState();
         return;
     }
+    if ((now - gWKSTextUpArmedTs) < kWKSTextUpMinGestureAgeSeconds) {
+        return;
+    }
     if (!WKSTextUpMoveTouchMatches(swipeArg)) {
         return;
     }
@@ -460,15 +783,25 @@ static void WKSTryHandleTextUpSwipeMoved(id panel, id swipeArg) {
     if (!WKSGetTouchLocationInPanel(swipeArg, panel, &currentPoint)) {
         return;
     }
-    if (!gWKSTextUpHasStartPoint) {
+    CGPoint startPoint = gWKSTextUpStartPoint;
+    BOOL hasStartPoint = gWKSTextUpHasStartPoint;
+    if (WKSGetTouchStartPoint(swipeArg, &startPoint)) {
+        hasStartPoint = YES;
+        gWKSTextUpStartPoint = startPoint;
+        gWKSTextUpHasStartPoint = YES;
+    }
+    if (!hasStartPoint) {
         gWKSTextUpStartPoint = currentPoint;
         gWKSTextUpHasStartPoint = YES;
+        WKSSetTouchStartPoint(swipeArg, currentPoint);
         return;
     }
 
-    CGFloat dy = currentPoint.y - gWKSTextUpStartPoint.y;
-    CGFloat dx = (CGFloat)fabs(currentPoint.x - gWKSTextUpStartPoint.x);
-    if (dy <= -kWKSTextUpMoveTriggerDistance && dx <= kWKSTextUpMoveMaxHorizontal) {
+    CGFloat dy = currentPoint.y - startPoint.y;
+    CGFloat dx = currentPoint.x - startPoint.x;
+    if (WKSIsValidUpSwipeDelta(dy, dx, kWKSTextUpMoveTriggerDistance, kWKSTextUpMoveMaxHorizontal) &&
+        WKSIsValidUpSwipeKeyPosition(panel, swipeArg, startPoint, currentPoint)) {
+        WKSSetTouchSwitchTriggered(swipeArg, YES);
         WKSMarkRecentMoveTrigger(panel, swipeArg);
         WKSClearTextUpMoveState();
         WKSHandleSwipe(panel);
@@ -480,13 +813,22 @@ static void WKSTryHandleTextUpSwipeCancelled(id panel, id swipeArg) {
         WKSClearTextUpMoveStateForPanel(panel);
         return;
     }
-    if (!WKSTextUpMoveTouchMatches(swipeArg) || !gWKSTextUpHasStartPoint) {
+    CGPoint startPoint = gWKSTextUpStartPoint;
+    BOOL hasStartPoint = gWKSTextUpHasStartPoint;
+    if (WKSGetTouchStartPoint(swipeArg, &startPoint)) {
+        hasStartPoint = YES;
+    }
+    if (!WKSTextUpMoveTouchMatches(swipeArg) || !hasStartPoint) {
         WKSClearTextUpMoveStateForPanel(panel);
         return;
     }
 
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
     if ((now - gWKSTextUpArmedTs) > kWKSTextUpStateTTLSeconds) {
+        WKSClearTextUpMoveStateForPanel(panel);
+        return;
+    }
+    if ((now - gWKSTextUpArmedTs) < kWKSTextUpMinGestureAgeSeconds) {
         WKSClearTextUpMoveStateForPanel(panel);
         return;
     }
@@ -497,9 +839,11 @@ static void WKSTryHandleTextUpSwipeCancelled(id panel, id swipeArg) {
         return;
     }
 
-    CGFloat dy = currentPoint.y - gWKSTextUpStartPoint.y;
-    CGFloat dx = (CGFloat)fabs(currentPoint.x - gWKSTextUpStartPoint.x);
-    if (dy <= -kWKSTextUpCancelTriggerDistance && dx <= kWKSTextUpMoveMaxHorizontal) {
+    CGFloat dy = currentPoint.y - startPoint.y;
+    CGFloat dx = currentPoint.x - startPoint.x;
+    if (WKSIsValidUpSwipeDelta(dy, dx, kWKSTextUpCancelTriggerDistance, kWKSTextUpMoveMaxHorizontal) &&
+        WKSIsValidUpSwipeKeyPosition(panel, swipeArg, startPoint, currentPoint)) {
+        WKSSetTouchSwitchTriggered(swipeArg, YES);
         WKSMarkRecentMoveTrigger(panel, swipeArg);
         WKSClearTextUpMoveStateForPanel(panel);
         WKSHandleSwipe(panel);
@@ -522,10 +866,66 @@ static void WKSForceDisableCursorMoveState(id panel) {
     }
 }
 
+static void WKSResetSwipeRecognitionState(id panel) {
+    if (!panel) {
+        return;
+    }
+    @try {
+        [panel setValue:@0 forKey:@"_adjustingTextPositionCount"];
+    } @catch (__unused NSException *e) {
+    }
+    @try {
+        [panel setValue:@0 forKey:@"_horSwipeGestureRespType"];
+    } @catch (__unused NSException *e) {
+    }
+    @try {
+        [panel setValue:nil forKey:@"_lastSwipeTouch"];
+    } @catch (__unused NSException *e) {
+    }
+    @try {
+        [panel setValue:nil forKey:@"_recognizingSwipeView"];
+    } @catch (__unused NSException *e) {
+    }
+    @try {
+        [panel setValue:nil forKey:@"_recognizingSwipeUpView"];
+    } @catch (__unused NSException *e) {
+    }
+    @try {
+        [panel setValue:nil forKey:@"_recognizingSwipeDownView"];
+    } @catch (__unused NSException *e) {
+    }
+    id keyView = nil;
+    @try {
+        keyView = [panel valueForKey:@"_currentTouchView"];
+    } @catch (__unused NSException *e) {
+    }
+    if (keyView) {
+        @try {
+            [keyView setValue:@NO forKey:@"moveCursorStyle"];
+        } @catch (__unused NSException *e) {
+        }
+    }
+}
+
+static void WKSHandleHorizontalBlockedReturn(id panel, id swipeArg, BOOL clearFlags) {
+    if (!panel) {
+        return;
+    }
+    if (clearFlags) {
+        WKSSetTouchHorizontalBlocked(swipeArg, NO);
+        WKSSetTouchSwitchTriggered(swipeArg, NO);
+    }
+    WKSForceDisableCursorMoveState(panel);
+    WKSResetSwipeRecognitionState(panel);
+    WKSClearTextUpMoveStateForPanel(panel);
+}
+
 static long long WKSPanelTryRecognizeSwipeTouch(id self, SEL _cmd, id touch, id keyView,
                                                  unsigned long long *supportsMoveCursorDirection,
                                                  BOOL force) {
-    BOOL keepNativeSpaceSwipe = WKSIsSpaceKeyView(keyView);
+    BOOL keepNativeSpaceSwipe = WKSIsSpaceKeyView(keyView) || WKSPanelIsDeleteKeyView(self, keyView);
+    WKSSetTouchKeepNativeSwipe(touch, keepNativeSpaceSwipe);
+
     if (supportsMoveCursorDirection && !keepNativeSpaceSwipe) {
         *supportsMoveCursorDirection = 0;
     }
@@ -938,7 +1338,13 @@ static void WKSEnsureDisableCursorAdjustForHost(id host) {
 
 static void WKSPanelAnySwipeBegan(id self, SEL _cmd, id arg, id touch) {
     id swipeRef = touch ?: arg;
+    if (WKSShouldIgnoreDeleteSwipe(self, swipeRef)) {
+        WKSClearTextUpMoveStateForPanel(self);
+        return;
+    }
     if (!WKSShouldKeepNativeSpaceSwipe(self, swipeRef)) {
+        WKSSetTouchHorizontalBlocked(swipeRef, NO);
+        WKSForceDisableCursorMoveState(self);
         WKSHandleTextUpSwipeBegan(self, swipeRef);
     } else {
         WKSClearTextUpMoveStateForPanel(self);
@@ -950,10 +1356,23 @@ static void WKSPanelAnySwipeBegan(id self, SEL _cmd, id arg, id touch) {
 
 static void WKSPanelAnySwipeMoved(id self, SEL _cmd, id arg, id touch) {
     id swipeRef = touch ?: arg;
+    if (WKSShouldIgnoreDeleteSwipe(self, swipeRef)) {
+        WKSClearTextUpMoveStateForPanel(self);
+        return;
+    }
+    BOOL shouldKeepNative = WKSShouldKeepNativeSpaceSwipe(self, swipeRef);
+    if (!shouldKeepNative) {
+        WKSForceDisableCursorMoveState(self);
+        if (WKSIsPredominantlyHorizontalSwipe(self, swipeRef)) {
+            WKSSetTouchHorizontalBlocked(swipeRef, YES);
+            WKSHandleHorizontalBlockedReturn(self, swipeRef, NO);
+            return;
+        }
+    }
     if (gOrigPanelAnySwipeMoved) {
         gOrigPanelAnySwipeMoved(self, _cmd, arg, touch);
     }
-    if (!WKSShouldKeepNativeSpaceSwipe(self, swipeRef)) {
+    if (!shouldKeepNative) {
         WKSTryHandleTextUpSwipeMoved(self, swipeRef);
     } else {
         WKSClearTextUpMoveStateForPanel(self);
@@ -962,6 +1381,10 @@ static void WKSPanelAnySwipeMoved(id self, SEL _cmd, id arg, id touch) {
 
 static void WKSPanelTouchesCancelled(id self, SEL _cmd, id touches, id event) {
     id swipeRef = touches ?: event;
+    if (WKSShouldIgnoreDeleteSwipe(self, swipeRef)) {
+        WKSClearTextUpMoveStateForPanel(self);
+        return;
+    }
     if (!WKSShouldKeepNativeSpaceSwipe(self, swipeRef)) {
         WKSTryHandleTextUpSwipeCancelled(self, swipeRef);
     } else {
@@ -972,11 +1395,41 @@ static void WKSPanelTouchesCancelled(id self, SEL _cmd, id touches, id event) {
     }
 }
 
+static void WKSPanelProcessTouchBegan(id self, SEL _cmd, id touch, id keyView) {
+    BOOL keepNativeSwipe = (WKSIsSpaceKeyView(keyView) || WKSPanelIsDeleteKeyView(self, keyView));
+    WKSSetTouchKeepNativeSwipe(touch, keepNativeSwipe);
+    WKSSetTouchSwitchTriggered(touch, NO);
+    WKSSetTouchHorizontalBlocked(touch, NO);
+    if (!keepNativeSwipe) {
+        CGPoint startPoint = CGPointZero;
+        if (WKSGetTouchLocationInPanel(touch, self, &startPoint)) {
+            WKSSetTouchStartPoint(touch, startPoint);
+        }
+        WKSForceDisableCursorMoveState(self);
+        WKSHandleTextUpSwipeBegan(self, touch);
+    } else {
+        WKSClearTextUpMoveStateForPanel(self);
+    }
+    if (gOrigPanelProcessTouchBegan) {
+        gOrigPanelProcessTouchBegan(self, _cmd, touch, keyView);
+    }
+}
+
 static void WKSPanelProcessTouchMoved(id self, SEL _cmd, id touch, id keyView) {
+    BOOL keepNativeSwipe = (WKSIsSpaceKeyView(keyView) || WKSPanelIsDeleteKeyView(self, keyView));
+    WKSSetTouchKeepNativeSwipe(touch, keepNativeSwipe);
+    if (!keepNativeSwipe) {
+        if (WKSIsPredominantlyHorizontalSwipe(self, touch)) {
+            WKSSetTouchHorizontalBlocked(touch, YES);
+            WKSHandleHorizontalBlockedReturn(self, touch, NO);
+            return;
+        }
+    }
     if (gOrigPanelProcessTouchMoved) {
         gOrigPanelProcessTouchMoved(self, _cmd, touch, keyView);
     }
-    if (!WKSIsSpaceKeyView(keyView)) {
+    if (!keepNativeSwipe) {
+        WKSForceDisableCursorMoveState(self);
         WKSTryHandleTextUpSwipeMoved(self, touch);
     } else {
         WKSClearTextUpMoveStateForPanel(self);
@@ -984,18 +1437,73 @@ static void WKSPanelProcessTouchMoved(id self, SEL _cmd, id touch, id keyView) {
 }
 
 static void WKSPanelProcessTouchCancel(id self, SEL _cmd, id touch, id keyView) {
-    if (!WKSIsSpaceKeyView(keyView)) {
-        WKSTryHandleTextUpSwipeCancelled(self, touch);
-    } else {
-        WKSClearTextUpMoveStateForPanel(self);
-    }
+    WKSSetTouchSwitchTriggered(touch, NO);
+    WKSSetTouchHorizontalBlocked(touch, NO);
+    WKSClearTextUpMoveStateForPanel(self);
     if (gOrigPanelProcessTouchCancel) {
         gOrigPanelProcessTouchCancel(self, _cmd, touch, keyView);
     }
 }
 
+static BOOL WKSPanelShouldCancelTouchEndForSwitch(id self, id touch) {
+    if (!touch || WKSShouldKeepNativeSpaceSwipe(self, touch)) {
+        return NO;
+    }
+    BOOL triggered = NO;
+    if (!WKSGetTouchSwitchTriggered(touch, &triggered)) {
+        return NO;
+    }
+    return triggered;
+}
+
+static BOOL WKSTouchSwitchTriggered(id touch) {
+    BOOL triggered = NO;
+    WKSGetTouchSwitchTriggered(touch, &triggered);
+    return triggered;
+}
+
+static BOOL WKSTouchHorizontalBlocked(id touch) {
+    BOOL blocked = NO;
+    WKSGetTouchHorizontalBlocked(touch, &blocked);
+    return blocked;
+}
+
+static void WKSPanelProcessTouchEnd(id self, SEL _cmd, id touch, id keyView) {
+    if (WKSPanelShouldCancelTouchEndForSwitch(self, touch) && gOrigPanelProcessTouchCancel) {
+        gOrigPanelProcessTouchCancel(self, @selector(processTouchCancel:keyView:), touch, keyView);
+        WKSSetTouchSwitchTriggered(touch, NO);
+        WKSSetTouchHorizontalBlocked(touch, NO);
+        WKSClearTextUpMoveStateForPanel(self);
+        return;
+    }
+    WKSSetTouchSwitchTriggered(touch, NO);
+    WKSSetTouchHorizontalBlocked(touch, NO);
+    if (gOrigPanelProcessTouchEnd) {
+        gOrigPanelProcessTouchEnd(self, _cmd, touch, keyView);
+    }
+}
+
+static void WKSPanelProcessTouchEndWithInterrupter(id self, SEL _cmd, id touch, id keyView, id interrupterKeyView) {
+    if (WKSPanelShouldCancelTouchEndForSwitch(self, touch) && gOrigPanelProcessTouchCancel) {
+        gOrigPanelProcessTouchCancel(self, @selector(processTouchCancel:keyView:), touch, keyView);
+        WKSSetTouchSwitchTriggered(touch, NO);
+        WKSSetTouchHorizontalBlocked(touch, NO);
+        WKSClearTextUpMoveStateForPanel(self);
+        return;
+    }
+    WKSSetTouchSwitchTriggered(touch, NO);
+    WKSSetTouchHorizontalBlocked(touch, NO);
+    if (gOrigPanelProcessTouchEndWithInterrupter) {
+        gOrigPanelProcessTouchEndWithInterrupter(self, _cmd, touch, keyView, interrupterKeyView);
+    }
+}
+
 static void WKSPanelSwipeUpBegan(id self, SEL _cmd, id arg, id touch, BOOL isOpenUpTips) {
     id swipeRef = touch ?: arg;
+    if (WKSShouldIgnoreDeleteSwipe(self, swipeRef)) {
+        WKSClearTextUpMoveStateForPanel(self);
+        return;
+    }
     BOOL shouldKeepNative = WKSShouldKeepNativeSpaceSwipe(self, swipeRef);
     BOOL openUpTips = isOpenUpTips;
     if (!shouldKeepNative) {
@@ -1014,6 +1522,14 @@ static void WKSPanelSwipeUpBegan(id self, SEL _cmd, id arg, id touch, BOOL isOpe
 
 static void WKSPanelSwipeUpMoved(id self, SEL _cmd, id arg, id touch) {
     id swipeRef = touch ?: arg;
+    if (WKSShouldIgnoreDeleteSwipe(self, swipeRef)) {
+        WKSClearTextUpMoveStateForPanel(self);
+        return;
+    }
+    if (!WKSShouldKeepNativeSpaceSwipe(self, swipeRef) && WKSTouchHorizontalBlocked(swipeRef)) {
+        WKSHandleHorizontalBlockedReturn(self, swipeRef, YES);
+        return;
+    }
     if (gOrigPanelSwipeUpMoved) {
         gOrigPanelSwipeUpMoved(self, _cmd, arg, touch);
     }
@@ -1025,14 +1541,27 @@ static void WKSPanelSwipeUpMoved(id self, SEL _cmd, id arg, id touch) {
 }
 
 static void WKSPanelSwipeUp(id self, SEL _cmd, id touch) {
+    if (WKSShouldIgnoreDeleteSwipe(self, touch)) {
+        WKSClearTextUpMoveStateForPanel(self);
+        return;
+    }
     gWKSSwipeCallbackDepth += 1;
     BOOL shouldHandle = (gWKSSwipeCallbackDepth == 1);
     BOOL shouldKeepNative = WKSShouldKeepNativeSpaceSwipe(self, touch);
+    if (!shouldKeepNative && WKSTouchHorizontalBlocked(touch)) {
+        WKSHandleHorizontalBlockedReturn(self, touch, YES);
+        gWKSSwipeCallbackDepth -= 1;
+        return;
+    }
     BOOL skipByRecentMove = WKSConsumeRecentMoveTrigger(self, touch);
-    if (gOrigPanelSwipeUp) {
+    BOOL alreadyTriggered = WKSTouchSwitchTriggered(touch);
+    BOOL shouldSwitchNow = (shouldHandle && !shouldKeepNative && !skipByRecentMove);
+    BOOL shouldSkipOrig = (!shouldKeepNative && (alreadyTriggered || shouldSwitchNow));
+    if (!shouldSkipOrig && gOrigPanelSwipeUp) {
         gOrigPanelSwipeUp(self, _cmd, touch);
     }
-    if (shouldHandle && !shouldKeepNative && !skipByRecentMove) {
+    if (shouldSwitchNow) {
+        WKSSetTouchSwitchTriggered(touch, YES);
         WKSHandleSwipe(self);
     }
     WKSClearTextUpMoveStateForPanel(self);
@@ -1040,13 +1569,23 @@ static void WKSPanelSwipeUp(id self, SEL _cmd, id touch) {
 }
 
 static void WKSPanelSwipeDown(id self, SEL _cmd, id touch) {
+    if (WKSShouldIgnoreDeleteSwipe(self, touch)) {
+        WKSClearTextUpMoveStateForPanel(self);
+        return;
+    }
     gWKSSwipeCallbackDepth += 1;
     BOOL shouldHandle = (gWKSSwipeCallbackDepth == 1);
     BOOL shouldKeepNative = WKSShouldKeepNativeSpaceSwipe(self, touch);
+    if (!shouldKeepNative && WKSTouchHorizontalBlocked(touch)) {
+        WKSHandleHorizontalBlockedReturn(self, touch, YES);
+        gWKSSwipeCallbackDepth -= 1;
+        return;
+    }
     if (gOrigPanelSwipeDown) {
         gOrigPanelSwipeDown(self, _cmd, touch);
     }
     if (shouldHandle && !shouldKeepNative) {
+        WKSSetTouchSwitchTriggered(touch, YES);
         WKSHandleSwipe(self);
     }
     WKSClearTextUpMoveStateForPanel(self);
@@ -1054,15 +1593,28 @@ static void WKSPanelSwipeDown(id self, SEL _cmd, id touch) {
 }
 
 static void WKSPanelSwipeEnded(id self, SEL _cmd, id arg, id touch) {
+    id swipeRef = touch ?: arg;
+    if (WKSShouldIgnoreDeleteSwipe(self, swipeRef)) {
+        WKSClearTextUpMoveStateForPanel(self);
+        return;
+    }
     gWKSSwipeCallbackDepth += 1;
     BOOL shouldHandle = (gWKSSwipeCallbackDepth == 1);
-    id swipeRef = touch ?: arg;
     BOOL shouldKeepNative = WKSShouldKeepNativeSpaceSwipe(self, swipeRef);
+    if (!shouldKeepNative && WKSTouchHorizontalBlocked(swipeRef)) {
+        WKSHandleHorizontalBlockedReturn(self, swipeRef, YES);
+        gWKSSwipeCallbackDepth -= 1;
+        return;
+    }
     BOOL skipByRecentMove = WKSConsumeRecentMoveTrigger(self, swipeRef);
-    if (gOrigPanelSwipeEnded) {
+    BOOL alreadyTriggered = WKSTouchSwitchTriggered(swipeRef);
+    BOOL shouldSwitchNow = (shouldHandle && !shouldKeepNative && !skipByRecentMove);
+    BOOL shouldSkipOrig = (!shouldKeepNative && (alreadyTriggered || shouldSwitchNow));
+    if (!shouldSkipOrig && gOrigPanelSwipeEnded) {
         gOrigPanelSwipeEnded(self, _cmd, arg, touch);
     }
-    if (shouldHandle && !shouldKeepNative && !skipByRecentMove) {
+    if (shouldSwitchNow) {
+        WKSSetTouchSwitchTriggered(swipeRef, YES);
         WKSHandleSwipe(self);
     }
     WKSClearTextUpMoveStateForPanel(self);
@@ -1071,6 +1623,10 @@ static void WKSPanelSwipeEnded(id self, SEL _cmd, id arg, id touch) {
 
 static void WKST9SwipeUpBegan(id self, SEL _cmd, id arg, id touch, BOOL isOpenUpTips) {
     id swipeRef = touch ?: arg;
+    if (WKSShouldIgnoreDeleteSwipe(self, swipeRef)) {
+        WKSClearTextUpMoveStateForPanel(self);
+        return;
+    }
     BOOL shouldKeepNative = WKSShouldKeepNativeSpaceSwipe(self, swipeRef);
     BOOL openUpTips = isOpenUpTips;
     if (!shouldKeepNative) {
@@ -1089,6 +1645,14 @@ static void WKST9SwipeUpBegan(id self, SEL _cmd, id arg, id touch, BOOL isOpenUp
 
 static void WKST9SwipeUpMoved(id self, SEL _cmd, id arg, id touch) {
     id swipeRef = touch ?: arg;
+    if (WKSShouldIgnoreDeleteSwipe(self, swipeRef)) {
+        WKSClearTextUpMoveStateForPanel(self);
+        return;
+    }
+    if (!WKSShouldKeepNativeSpaceSwipe(self, swipeRef) && WKSTouchHorizontalBlocked(swipeRef)) {
+        WKSHandleHorizontalBlockedReturn(self, swipeRef, YES);
+        return;
+    }
     if (gOrigT9SwipeUpMoved) {
         gOrigT9SwipeUpMoved(self, _cmd, arg, touch);
     }
@@ -1100,14 +1664,27 @@ static void WKST9SwipeUpMoved(id self, SEL _cmd, id arg, id touch) {
 }
 
 static void WKST9SwipeUp(id self, SEL _cmd, id touch) {
+    if (WKSShouldIgnoreDeleteSwipe(self, touch)) {
+        WKSClearTextUpMoveStateForPanel(self);
+        return;
+    }
     gWKSSwipeCallbackDepth += 1;
     BOOL shouldHandle = (gWKSSwipeCallbackDepth == 1);
     BOOL shouldKeepNative = WKSShouldKeepNativeSpaceSwipe(self, touch);
+    if (!shouldKeepNative && WKSTouchHorizontalBlocked(touch)) {
+        WKSHandleHorizontalBlockedReturn(self, touch, YES);
+        gWKSSwipeCallbackDepth -= 1;
+        return;
+    }
     BOOL skipByRecentMove = WKSConsumeRecentMoveTrigger(self, touch);
-    if (gOrigT9SwipeUp) {
+    BOOL alreadyTriggered = WKSTouchSwitchTriggered(touch);
+    BOOL shouldSwitchNow = (shouldHandle && !shouldKeepNative && !skipByRecentMove);
+    BOOL shouldSkipOrig = (!shouldKeepNative && (alreadyTriggered || shouldSwitchNow));
+    if (!shouldSkipOrig && gOrigT9SwipeUp) {
         gOrigT9SwipeUp(self, _cmd, touch);
     }
-    if (shouldHandle && !shouldKeepNative && !skipByRecentMove) {
+    if (shouldSwitchNow) {
+        WKSSetTouchSwitchTriggered(touch, YES);
         WKSHandleSwipe(self);
     }
     WKSClearTextUpMoveStateForPanel(self);
@@ -1115,13 +1692,23 @@ static void WKST9SwipeUp(id self, SEL _cmd, id touch) {
 }
 
 static void WKST9SwipeDown(id self, SEL _cmd, id touch) {
+    if (WKSShouldIgnoreDeleteSwipe(self, touch)) {
+        WKSClearTextUpMoveStateForPanel(self);
+        return;
+    }
     gWKSSwipeCallbackDepth += 1;
     BOOL shouldHandle = (gWKSSwipeCallbackDepth == 1);
     BOOL shouldKeepNative = WKSShouldKeepNativeSpaceSwipe(self, touch);
+    if (!shouldKeepNative && WKSTouchHorizontalBlocked(touch)) {
+        WKSHandleHorizontalBlockedReturn(self, touch, YES);
+        gWKSSwipeCallbackDepth -= 1;
+        return;
+    }
     if (gOrigT9SwipeDown) {
         gOrigT9SwipeDown(self, _cmd, touch);
     }
     if (shouldHandle && !shouldKeepNative) {
+        WKSSetTouchSwitchTriggered(touch, YES);
         WKSHandleSwipe(self);
     }
     WKSClearTextUpMoveStateForPanel(self);
@@ -1130,6 +1717,10 @@ static void WKST9SwipeDown(id self, SEL _cmd, id touch) {
 
 static void WKST26SwipeUpBegan(id self, SEL _cmd, id arg, id touch, BOOL isOpenUpTips) {
     id swipeRef = touch ?: arg;
+    if (WKSShouldIgnoreDeleteSwipe(self, swipeRef)) {
+        WKSClearTextUpMoveStateForPanel(self);
+        return;
+    }
     BOOL shouldKeepNative = WKSShouldKeepNativeSpaceSwipe(self, swipeRef);
     BOOL openUpTips = isOpenUpTips;
     if (!shouldKeepNative) {
@@ -1148,6 +1739,14 @@ static void WKST26SwipeUpBegan(id self, SEL _cmd, id arg, id touch, BOOL isOpenU
 
 static void WKST26SwipeUpMoved(id self, SEL _cmd, id arg, id touch) {
     id swipeRef = touch ?: arg;
+    if (WKSShouldIgnoreDeleteSwipe(self, swipeRef)) {
+        WKSClearTextUpMoveStateForPanel(self);
+        return;
+    }
+    if (!WKSShouldKeepNativeSpaceSwipe(self, swipeRef) && WKSTouchHorizontalBlocked(swipeRef)) {
+        WKSHandleHorizontalBlockedReturn(self, swipeRef, YES);
+        return;
+    }
     if (gOrigT26SwipeUpMoved) {
         gOrigT26SwipeUpMoved(self, _cmd, arg, touch);
     }
@@ -1159,14 +1758,27 @@ static void WKST26SwipeUpMoved(id self, SEL _cmd, id arg, id touch) {
 }
 
 static void WKST26SwipeUp(id self, SEL _cmd, id touch) {
+    if (WKSShouldIgnoreDeleteSwipe(self, touch)) {
+        WKSClearTextUpMoveStateForPanel(self);
+        return;
+    }
     gWKSSwipeCallbackDepth += 1;
     BOOL shouldHandle = (gWKSSwipeCallbackDepth == 1);
     BOOL shouldKeepNative = WKSShouldKeepNativeSpaceSwipe(self, touch);
+    if (!shouldKeepNative && WKSTouchHorizontalBlocked(touch)) {
+        WKSHandleHorizontalBlockedReturn(self, touch, YES);
+        gWKSSwipeCallbackDepth -= 1;
+        return;
+    }
     BOOL skipByRecentMove = WKSConsumeRecentMoveTrigger(self, touch);
-    if (gOrigT26SwipeUp) {
+    BOOL alreadyTriggered = WKSTouchSwitchTriggered(touch);
+    BOOL shouldSwitchNow = (shouldHandle && !shouldKeepNative && !skipByRecentMove);
+    BOOL shouldSkipOrig = (!shouldKeepNative && (alreadyTriggered || shouldSwitchNow));
+    if (!shouldSkipOrig && gOrigT26SwipeUp) {
         gOrigT26SwipeUp(self, _cmd, touch);
     }
-    if (shouldHandle && !shouldKeepNative && !skipByRecentMove) {
+    if (shouldSwitchNow) {
+        WKSSetTouchSwitchTriggered(touch, YES);
         WKSHandleSwipe(self);
     }
     WKSClearTextUpMoveStateForPanel(self);
@@ -1174,13 +1786,23 @@ static void WKST26SwipeUp(id self, SEL _cmd, id touch) {
 }
 
 static void WKST26SwipeDown(id self, SEL _cmd, id touch) {
+    if (WKSShouldIgnoreDeleteSwipe(self, touch)) {
+        WKSClearTextUpMoveStateForPanel(self);
+        return;
+    }
     gWKSSwipeCallbackDepth += 1;
     BOOL shouldHandle = (gWKSSwipeCallbackDepth == 1);
     BOOL shouldKeepNative = WKSShouldKeepNativeSpaceSwipe(self, touch);
+    if (!shouldKeepNative && WKSTouchHorizontalBlocked(touch)) {
+        WKSHandleHorizontalBlockedReturn(self, touch, YES);
+        gWKSSwipeCallbackDepth -= 1;
+        return;
+    }
     if (gOrigT26SwipeDown) {
         gOrigT26SwipeDown(self, _cmd, touch);
     }
     if (shouldHandle && !shouldKeepNative) {
+        WKSSetTouchSwitchTriggered(touch, YES);
         WKSHandleSwipe(self);
     }
     WKSClearTextUpMoveStateForPanel(self);
@@ -1321,10 +1943,17 @@ static void WKSInit(void) {
                               (IMP)WKSPanelSwipeEnded, (IMP *)&gOrigPanelSwipeEnded);
         WKSSwizzleClassMethod(panel, @selector(touchesCancelled:withEvent:),
                               (IMP)WKSPanelTouchesCancelled, (IMP *)&gOrigPanelTouchesCancelled);
+        WKSSwizzleClassMethod(panel, @selector(processTouchBegan:keyView:),
+                              (IMP)WKSPanelProcessTouchBegan, (IMP *)&gOrigPanelProcessTouchBegan);
         WKSSwizzleClassMethod(panel, @selector(processTouchMoveWithTouch:keyView:),
                               (IMP)WKSPanelProcessTouchMoved, (IMP *)&gOrigPanelProcessTouchMoved);
         WKSSwizzleClassMethod(panel, @selector(processTouchCancel:keyView:),
                               (IMP)WKSPanelProcessTouchCancel, (IMP *)&gOrigPanelProcessTouchCancel);
+        WKSSwizzleClassMethod(panel, @selector(processTouchEnd:keyView:),
+                              (IMP)WKSPanelProcessTouchEnd, (IMP *)&gOrigPanelProcessTouchEnd);
+        WKSSwizzleClassMethod(panel, @selector(processTouchEnd:keyView:interrupterKeyView:),
+                              (IMP)WKSPanelProcessTouchEndWithInterrupter,
+                              (IMP *)&gOrigPanelProcessTouchEndWithInterrupter);
         WKSSwizzleClassMethod(panel, @selector(processSwipeUpBegan:touch:isOpenUpTips:),
                               (IMP)WKSPanelSwipeUpBegan, (IMP *)&gOrigPanelSwipeUpBegan);
         WKSSwizzleClassMethod(panel, @selector(processSwipeUpMoved:touch:),
