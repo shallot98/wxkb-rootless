@@ -18,7 +18,7 @@ static __weak id gWKSRecentMoveTriggerPanel = nil;
 static uintptr_t gWKSRecentMoveTriggerTouchAddr = 0;
 static CFAbsoluteTime gWKSRecentMoveTriggerTs = 0;
 
-static const NSTimeInterval kWKSDebounceSeconds = 0.20;
+static const NSTimeInterval kWKSDebounceSeconds = 0.10;
 static const NSTimeInterval kWKSScheduleDelaySeconds = 0.06;
 static const NSTimeInterval kWKSSwitchCooldownSeconds = 0.12;
 static const NSTimeInterval kWKSAdjustingRetryDelaySeconds = 0.06;
@@ -74,6 +74,7 @@ static void (*gOrigSymbolCellSetBorderPosition)(id, SEL, unsigned long long) = N
 
 static void WKSHandleSwipe(id context);
 static void WKSAttemptToggleWhenReady(id context, int retries);
+static void WKSResetSwipeRecognitionState(id panel);
 static void WKSSwizzleClassMethod(Class cls, SEL sel, IMP newImp, IMP *oldStore);
 
 static const void *kWKSTouchStartPointAssocKey = &kWKSTouchStartPointAssocKey;
@@ -804,6 +805,7 @@ static void WKSTryHandleTextUpSwipeMoved(id panel, id swipeArg) {
         WKSSetTouchSwitchTriggered(swipeArg, YES);
         WKSMarkRecentMoveTrigger(panel, swipeArg);
         WKSClearTextUpMoveState();
+        WKSResetSwipeRecognitionState(panel);
         WKSHandleSwipe(panel);
     }
 }
@@ -1244,13 +1246,17 @@ static void WKSAttemptToggleWhenReady(id context, int retries) {
     }
 
     BOOL adjusting = WKSHostIsAdjustingTextPosition(host);
-    if (adjusting && retries > 0) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                     (int64_t)(kWKSAdjustingRetryDelaySeconds * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            WKSAttemptToggleWhenReady(context, retries - 1);
-        });
-        return;
+    if (adjusting) {
+        if (retries > 0) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                         (int64_t)(kWKSAdjustingRetryDelaySeconds * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                WKSAttemptToggleWhenReady(context, retries - 1);
+            });
+            return;
+        }
+        // retries 耗尽：强制重置 adjusting 状态，继续执行切换
+        WKSResetSwipeRecognitionState(panel);
     }
 
     long long beforeHostType = LLONG_MIN;
@@ -1328,6 +1334,13 @@ static void WKSHandleSwipe(id context) {
         }
 
         gWKSInSwitch = YES;
+        // 兜底：500ms 后强制释放锁，防止重试链路意外卡死
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (gWKSInSwitch) {
+                gWKSInSwitch = NO;
+            }
+        });
         WKSAttemptToggleWhenReady(strongContext, kWKSAdjustingMaxRetries);
     });
 }
@@ -1373,6 +1386,7 @@ static void WKSPanelAnySwipeMoved(id self, SEL _cmd, id arg, id touch) {
         gOrigPanelAnySwipeMoved(self, _cmd, arg, touch);
     }
     if (!shouldKeepNative) {
+        WKSForceDisableCursorMoveState(self);
         WKSTryHandleTextUpSwipeMoved(self, swipeRef);
     } else {
         WKSClearTextUpMoveStateForPanel(self);
@@ -1507,6 +1521,7 @@ static void WKSPanelSwipeUpBegan(id self, SEL _cmd, id arg, id touch, BOOL isOpe
     BOOL shouldKeepNative = WKSShouldKeepNativeSpaceSwipe(self, swipeRef);
     BOOL openUpTips = isOpenUpTips;
     if (!shouldKeepNative) {
+        WKSResetSwipeRecognitionState(self);
         BOOL useTextUpMove = WKSPanelShouldUseTextUpMoveMode(self, swipeRef);
         if (useTextUpMove) {
             openUpTips = NO;
