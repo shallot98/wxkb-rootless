@@ -4,7 +4,9 @@
 #import <limits.h>
 #import <math.h>
 #import <stdint.h>
+#import <CoreFoundation/CoreFoundation.h>
 
+static BOOL gWKSSwipeEnabled = YES;
 static BOOL gWKSInSwitch = NO;
 static BOOL gWKSSwitchScheduled = NO;
 static CFAbsoluteTime gWKSLastSwitchTs = 0;
@@ -24,12 +26,13 @@ static const NSTimeInterval kWKSSwitchCooldownSeconds = 0.12;
 static const NSTimeInterval kWKSAdjustingRetryDelaySeconds = 0.06;
 static const NSTimeInterval kWKSSwitchApplyDelaySeconds = 0.08;
 static const int kWKSAdjustingMaxRetries = 10;
-static const CGFloat kWKSTextUpMoveTriggerDistance = 18.0;
+static const CGFloat kWKSTextUpMoveTriggerDistance = 16.0;
 static const CGFloat kWKSTextUpMoveMaxHorizontal = 20.0;
 static const CGFloat kWKSTextUpCancelTriggerDistance = 24.0;
-static const CGFloat kWKSTextUpVerticalRatio = 1.80;
+static const CGFloat kWKSTextUpVerticalRatio = 1.50;
 static const CGFloat kWKSTextUpKeyTopMargin = 3.0;
-static const NSTimeInterval kWKSTextUpMinGestureAgeSeconds = 0.07;
+static const NSTimeInterval kWKSTextUpMinGestureAgeSeconds = 0.055;
+static const CGFloat kWKSTextUpMinVelocity = 300.0; // pt/s，低于此速度视为打字弹起而非主动上划
 static const NSTimeInterval kWKSTextUpStateTTLSeconds = 0.80;
 static const NSTimeInterval kWKSRecentMoveTriggerTTLSeconds = 0.35;
 static const CGFloat kWKSHorizontalBlockMinDistance = 10.0;
@@ -76,6 +79,33 @@ static void WKSHandleSwipe(id context);
 static void WKSAttemptToggleWhenReady(id context, int retries);
 static void WKSResetSwipeRecognitionState(id panel);
 static void WKSSwizzleClassMethod(Class cls, SEL sel, IMP newImp, IMP *oldStore);
+static void WKSLoadPreferences(void);
+static void WKSPreferencesChanged(CFNotificationCenterRef center, void *observer, CFStringRef name,
+                                  const void *object, CFDictionaryRef userInfo);
+
+static void WKSLoadPreferences(void) {
+    CFPreferencesAppSynchronize(CFSTR("com.yourname.wechatkeyboardswitch"));
+    CFTypeRef val = CFPreferencesCopyAppValue(CFSTR("swipeEnabled"),
+                                              CFSTR("com.yourname.wechatkeyboardswitch"));
+    if (val) {
+        if (CFGetTypeID(val) == CFBooleanGetTypeID()) {
+            gWKSSwipeEnabled = CFBooleanGetValue((CFBooleanRef)val);
+        }
+        CFRelease(val);
+    } else {
+        gWKSSwipeEnabled = YES; // 默认开启
+    }
+}
+
+static void WKSPreferencesChanged(CFNotificationCenterRef center, void *observer, CFStringRef name,
+                                  const void *object, CFDictionaryRef userInfo) {
+    (void)center;
+    (void)observer;
+    (void)name;
+    (void)object;
+    (void)userInfo;
+    WKSLoadPreferences();
+}
 
 static const void *kWKSTouchStartPointAssocKey = &kWKSTouchStartPointAssocKey;
 static const void *kWKSTouchKeepNativeSwipeAssocKey = &kWKSTouchKeepNativeSwipeAssocKey;
@@ -751,6 +781,11 @@ static BOOL WKSIsValidUpSwipeKeyPosition(id panel, id swipeArg, CGPoint startPoi
     if (!CGRectContainsPoint(keyFrame, startPoint)) {
         return NO;
     }
+    // 快速长划：位移超过 30pt 时放宽出界要求，允许仍在按键内触发
+    CGFloat absDy = (CGFloat)fabs(currentPoint.y - startPoint.y);
+    if (absDy >= 30.0) {
+        return YES;
+    }
     return (currentPoint.y <= (CGRectGetMinY(keyFrame) - kWKSTextUpKeyTopMargin));
 }
 
@@ -800,8 +835,11 @@ static void WKSTryHandleTextUpSwipeMoved(id panel, id swipeArg) {
 
     CGFloat dy = currentPoint.y - startPoint.y;
     CGFloat dx = currentPoint.x - startPoint.x;
+    CFAbsoluteTime elapsed = now - gWKSTextUpArmedTs;
+    CGFloat velocity = (elapsed > 0.001) ? (CGFloat)(fabs(dy) / elapsed) : 0.0;
     if (WKSIsValidUpSwipeDelta(dy, dx, kWKSTextUpMoveTriggerDistance, kWKSTextUpMoveMaxHorizontal) &&
-        WKSIsValidUpSwipeKeyPosition(panel, swipeArg, startPoint, currentPoint)) {
+        WKSIsValidUpSwipeKeyPosition(panel, swipeArg, startPoint, currentPoint) &&
+        velocity >= kWKSTextUpMinVelocity) {
         WKSSetTouchSwitchTriggered(swipeArg, YES);
         WKSMarkRecentMoveTrigger(panel, swipeArg);
         WKSClearTextUpMoveState();
@@ -1311,6 +1349,9 @@ static void WKSAttemptToggleWhenReady(id context, int retries) {
 }
 
 static void WKSHandleSwipe(id context) {
+    if (!gWKSSwipeEnabled) {
+        return;
+    }
     if (gWKSInSwitch || gWKSSwitchScheduled) {
         return;
     }
@@ -1945,6 +1986,11 @@ static void WKSSwizzleClassMethod(Class cls, SEL sel, IMP newImp, IMP *oldStore)
 
 __attribute__((constructor))
 static void WKSInit(void) {
+    WKSLoadPreferences();
+    CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
+                                    WKSPreferencesChanged,
+                                    CFSTR("com.yourname.wechatkeyboardswitch/preferences.changed"), NULL,
+                                    CFNotificationSuspensionBehaviorDeliverImmediately);
     @autoreleasepool {
         Class panel = objc_getClass("WBCommonPanelView");
         WKSSwizzleClassMethod(panel, @selector(tryRecognizeSwipeTouch:keyView:supportsMoveCursorDirection:force:),

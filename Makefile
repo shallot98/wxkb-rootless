@@ -25,5 +25,12 @@ WeChatKeyboardSwitch_LDFLAGS = -undefined dynamic_lookup
 
 include $(THEOS_MAKE_PATH)/tweak.mk
 
+SUBPROJECTS += WKSPreferences
+include $(THEOS_MAKE_PATH)/aggregate.mk
+
+after-stage::
+	$(ECHO_NOTHING)mkdir -p $(THEOS_STAGING_DIR)/Library/PreferenceLoader/Preferences$(ECHO_END)
+	$(ECHO_NOTHING)cp WKSPreferences/entry.plist $(THEOS_STAGING_DIR)/Library/PreferenceLoader/Preferences/com.yourname.wechatkeyboardswitch.plist$(ECHO_END)
+
 after-install::
 	install.exec "killall -9 wxkb_plugin WeType || true"

@@ -6,4 +6,4 @@ Description: 微信输入法键盘滑动切换中英文插件，支持 rootless 
 Maintainer: Your Name <your.email@example.com>
 Author: Your Name <your.email@example.com>
 Section: Tweaks
-Depends: mobilesubstrate | ellekit | libhooker
+Depends: mobilesubstrate | ellekit | libhooker, preferenceloader
