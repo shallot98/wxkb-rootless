@@ -93,6 +93,7 @@ static BOOL WKSUseGestureRecognizerMode(void);
 static BOOL WKSShouldAllowPanelSwipeTouch(id panel, UITouch *touch);
 static void WKSHandlePanelSwipeGesture(id panel, UISwipeGestureRecognizer *gesture);
 static void WKSEnsurePanelSwipeRecognizers(id panelObj);
+static BOOL WKSShouldCancelTouchForPanelSwipeUp(id panelObj);
 
 @interface WKSPanelSwipeGestureBridge : NSObject <UIGestureRecognizerDelegate>
 + (instancetype)shared;
@@ -157,6 +158,38 @@ static const void *kWKSTouchBeganTsAssocKey = &kWKSTouchBeganTsAssocKey;
 static const void *kWKSTouchSwitchHandledAssocKey = &kWKSTouchSwitchHandledAssocKey;
 static const void *kWKSPanelSwipeUpRecognizerAssocKey = &kWKSPanelSwipeUpRecognizerAssocKey;
 static const void *kWKSPanelSwipeDownRecognizerAssocKey = &kWKSPanelSwipeDownRecognizerAssocKey;
+static const void *kWKSPanelCancelTouchEndUntilTsAssocKey = &kWKSPanelCancelTouchEndUntilTsAssocKey;
+
+static void WKSSetPanelCancelTouchEndUntil(id panel, CFAbsoluteTime untilTs) {
+    if (!panel) {
+        return;
+    }
+    @try {
+        objc_setAssociatedObject(panel, kWKSPanelCancelTouchEndUntilTsAssocKey,
+                                 @(untilTs), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    } @catch (__unused NSException *e) {
+    }
+}
+
+static BOOL WKSConsumePanelCancelTouchEndIfNeeded(id panel) {
+    if (!panel) {
+        return NO;
+    }
+    @try {
+        id value = objc_getAssociatedObject(panel, kWKSPanelCancelTouchEndUntilTsAssocKey);
+        if ([value isKindOfClass:[NSNumber class]]) {
+            CFAbsoluteTime untilTs = [(NSNumber *)value doubleValue];
+            CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+            if (untilTs > now) {
+                objc_setAssociatedObject(panel, kWKSPanelCancelTouchEndUntilTsAssocKey,
+                                         @(0.0), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                return YES;
+            }
+        }
+    } @catch (__unused NSException *e) {
+    }
+    return NO;
+}
 
 static BOOL WKSInvokeLongLongGetter(id obj, SEL sel, long long *outValue) {
     if (!obj || !sel || !outValue || ![obj respondsToSelector:sel]) {
@@ -842,8 +875,26 @@ static void WKSHandlePanelSwipeGesture(id panel, UISwipeGestureRecognizer *gestu
         return;
     }
 
+    if (gesture.direction == UISwipeGestureRecognizerDirectionUp &&
+        WKSShouldCancelTouchForPanelSwipeUp(panel)) {
+        // 英文键盘上滑时，下一次 touchEnd 改为 cancel，避免同时输入字母。
+        WKSSetPanelCancelTouchEndUntil(panel, now + 0.12);
+    }
+
     WKSResetSwipeRecognitionState(panel);
     WKSHandleSwipe(panel);
+}
+
+static BOOL WKSShouldCancelTouchForPanelSwipeUp(id panelObj) {
+    if (!panelObj) {
+        return NO;
+    }
+    Class t26Class = objc_getClass("WBT26Panel");
+    if (t26Class && [panelObj isKindOfClass:t26Class]) {
+        return YES;
+    }
+    NSString *className = NSStringFromClass([panelObj class]);
+    return [className containsString:@"T26"];
 }
 
 static void WKSEnsurePanelSwipeRecognizers(id panelObj) {
@@ -859,7 +910,7 @@ static void WKSEnsurePanelSwipeRecognizers(id panelObj) {
                                                             action:@selector(handlePanelSwipe:)];
         swipeUp.direction = UISwipeGestureRecognizerDirectionUp;
         swipeUp.numberOfTouchesRequired = 1;
-        swipeUp.cancelsTouchesInView = NO;
+        swipeUp.cancelsTouchesInView = WKSShouldCancelTouchForPanelSwipeUp(panelObj);
         swipeUp.delaysTouchesBegan = NO;
         swipeUp.delaysTouchesEnded = NO;
         swipeUp.delegate = bridge;
@@ -883,6 +934,7 @@ static void WKSEnsurePanelSwipeRecognizers(id panelObj) {
                                  swipeDown, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
 
+    swipeUp.cancelsTouchesInView = WKSShouldCancelTouchForPanelSwipeUp(panelObj);
     swipeUp.enabled = gWKSSwipeEnabled;
     swipeDown.enabled = gWKSSwipeEnabled;
 
@@ -1864,10 +1916,14 @@ static void WKSPanelProcessTouchCancel(id self, SEL _cmd, id touch, id keyView) 
 }
 
 static BOOL WKSPanelShouldCancelTouchEndForSwitch(id self, id touch) {
-    (void)self;
-    (void)touch;
-    // 避免通过 touchCancel 干预系统触摸收尾，防止手势识别链路被卡死导致仅首次生效。
-    return NO;
+    if (!WKSUseGestureRecognizerMode() || !self || !touch) {
+        return NO;
+    }
+    if (!WKSConsumePanelCancelTouchEndIfNeeded(self)) {
+        return NO;
+    }
+    // 仅对非空格/删除键生效，避免破坏原生空格滑动与删除行为。
+    return !WKSShouldKeepNativeSpaceSwipe(self, touch);
 }
 
 static BOOL WKSShouldTriggerSwitchOnTouchEndFallback(id panel, id touch) {
