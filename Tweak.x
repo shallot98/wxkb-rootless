@@ -875,9 +875,10 @@ static void WKSHandlePanelSwipeGesture(id panel, UISwipeGestureRecognizer *gestu
         return;
     }
 
-    if (gesture.direction == UISwipeGestureRecognizerDirectionUp &&
+    if ((gesture.direction == UISwipeGestureRecognizerDirectionUp ||
+         gesture.direction == UISwipeGestureRecognizerDirectionDown) &&
         WKSShouldCancelTouchForPanelSwipeUp(panel)) {
-        // 英文键盘上滑时，下一次 touchEnd 改为 cancel，避免同时输入字母。
+        // 英文键盘上下滑时，下一次 touchEnd 改为 cancel，避免同时输入字母。
         WKSSetPanelCancelTouchEndUntil(panel, now + 0.12);
     }
 
@@ -925,7 +926,7 @@ static void WKSEnsurePanelSwipeRecognizers(id panelObj) {
                                                               action:@selector(handlePanelSwipe:)];
         swipeDown.direction = UISwipeGestureRecognizerDirectionDown;
         swipeDown.numberOfTouchesRequired = 1;
-        swipeDown.cancelsTouchesInView = NO;
+        swipeDown.cancelsTouchesInView = WKSShouldCancelTouchForPanelSwipeUp(panelObj);
         swipeDown.delaysTouchesBegan = NO;
         swipeDown.delaysTouchesEnded = NO;
         swipeDown.delegate = bridge;
@@ -935,6 +936,7 @@ static void WKSEnsurePanelSwipeRecognizers(id panelObj) {
     }
 
     swipeUp.cancelsTouchesInView = WKSShouldCancelTouchForPanelSwipeUp(panelObj);
+    swipeDown.cancelsTouchesInView = WKSShouldCancelTouchForPanelSwipeUp(panelObj);
     swipeUp.enabled = gWKSSwipeEnabled;
     swipeDown.enabled = gWKSSwipeEnabled;
 
