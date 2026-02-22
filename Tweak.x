@@ -1,6 +1,7 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #import <QuartzCore/QuartzCore.h>
 #import <limits.h>
 #import <math.h>
@@ -101,6 +102,8 @@ static BOOL WKSShouldAllowPanelSwipeTouch(id panel, UITouch *touch);
 static void WKSHandlePanelSwipeGesture(id panel, UISwipeGestureRecognizer *gesture);
 static void WKSEnsurePanelSwipeRecognizers(id panelObj);
 static BOOL WKSShouldCancelTouchForPanelSwipeUp(id panelObj);
+static BOOL WKSIsKeyViewLike(UIView *view);
+static void WKSShowKeyboardTouchRipple(id panel, id touch);
 
 @interface WKSPanelSwipeGestureBridge : NSObject <UIGestureRecognizerDelegate>
 + (instancetype)shared;
@@ -1474,6 +1477,90 @@ static NSString *const kWKSKeyboardGlassFillLayerName = @"wks_keyboard_glass_fil
 static NSString *const kWKSKeyboardGlassGlossLayerName = @"wks_keyboard_glass_gloss";
 static NSString *const kWKSToolbarGlassFillLayerName = @"wks_toolbar_glass_fill";
 static NSString *const kWKSToolbarGlassGlossLayerName = @"wks_toolbar_glass_gloss";
+static NSString *const kWKSKeyboardNativeTopTintLayerName = @"wks_keyboard_bg_top_tint";
+static NSString *const kWKSKeyboardSkinBackLayerName = @"wks_keyboard_skin_back";
+static NSString *const kWKSKeyboardRippleHostLayerName = @"wks_keyboard_ripple_host";
+static const NSInteger kWKSKeyboardNativeGlassEffectTag = 1464552193;
+static const NSInteger kWKSKeyboardNativeGlassTintTag = 1464552194;
+static const NSInteger kWKSKeyboardSkinImageViewTag = 1464552195;
+static BOOL WKSSystemPrefersDarkAppearance(void);
+static BOOL WKSKeyboardThemePrefersDarkAppearance(void);
+static BOOL WKSReadKeyboardThemeDarkAppearance(BOOL *darkModeOut);
+
+static BOOL WKSIsDarkAppearanceForView(UIView *view) {
+    BOOL keyboardThemeDark = NO;
+    if (WKSReadKeyboardThemeDarkAppearance(&keyboardThemeDark)) {
+        return keyboardThemeDark;
+    }
+    if (!view) {
+        return WKSSystemPrefersDarkAppearance();
+    }
+    if (@available(iOS 13.0, *)) {
+        UITraitCollection *trait = view.traitCollection;
+        if (trait && trait.userInterfaceStyle != UIUserInterfaceStyleUnspecified) {
+            return trait.userInterfaceStyle == UIUserInterfaceStyleDark;
+        }
+        UIWindow *window = view.window;
+        if (window) {
+            UIUserInterfaceStyle style = window.traitCollection.userInterfaceStyle;
+            if (style != UIUserInterfaceStyleUnspecified) {
+                return style == UIUserInterfaceStyleDark;
+            }
+        }
+    }
+    return WKSSystemPrefersDarkAppearance();
+}
+
+static BOOL WKSIsDarkAppearanceForLayer(CALayer *layer) {
+    if (!layer) {
+        return NO;
+    }
+    id delegate = layer.delegate;
+    if ([delegate isKindOfClass:[UIView class]]) {
+        return WKSIsDarkAppearanceForView((UIView *)delegate);
+    }
+    if (@available(iOS 13.0, *)) {
+        if ([delegate respondsToSelector:@selector(traitCollection)]) {
+            UITraitCollection *trait = [delegate traitCollection];
+            if (trait.userInterfaceStyle == UIUserInterfaceStyleDark) {
+                return YES;
+            }
+        }
+    }
+    return NO;
+}
+
+static NSArray *WKSKeyboardGlassFillColors(BOOL darkMode) {
+    if (darkMode) {
+        return @[
+            (id)[UIColor colorWithRed:0.20 green:0.22 blue:0.28 alpha:0.72].CGColor,
+            (id)[UIColor colorWithRed:0.28 green:0.21 blue:0.34 alpha:0.66].CGColor,
+            (id)[UIColor colorWithRed:0.17 green:0.33 blue:0.30 alpha:0.62].CGColor,
+            (id)[UIColor colorWithRed:0.35 green:0.31 blue:0.18 alpha:0.58].CGColor
+        ];
+    }
+    return @[
+        (id)[UIColor colorWithRed:0.54 green:0.85 blue:1.00 alpha:0.28].CGColor,
+        (id)[UIColor colorWithRed:0.68 green:0.63 blue:1.00 alpha:0.24].CGColor,
+        (id)[UIColor colorWithRed:0.43 green:0.95 blue:0.85 alpha:0.20].CGColor,
+        (id)[UIColor colorWithRed:1.00 green:0.79 blue:0.58 alpha:0.18].CGColor
+    ];
+}
+
+static NSArray *WKSKeyboardGlassGlossColors(BOOL darkMode) {
+    if (darkMode) {
+        return @[
+            (id)[UIColor colorWithWhite:1.0 alpha:0.14].CGColor,
+            (id)[UIColor colorWithWhite:1.0 alpha:0.06].CGColor,
+            (id)[UIColor colorWithWhite:1.0 alpha:0.015].CGColor
+        ];
+    }
+    return @[
+        (id)[UIColor colorWithWhite:1.0 alpha:0.26].CGColor,
+        (id)[UIColor colorWithWhite:1.0 alpha:0.12].CGColor,
+        (id)[UIColor colorWithWhite:1.0 alpha:0.03].CGColor
+    ];
+}
 
 static CAGradientLayer *WKSFindNamedGradientLayer(CALayer *container, NSString *name) {
     if (!container || name.length == 0) {
@@ -1489,6 +1576,162 @@ static CAGradientLayer *WKSFindNamedGradientLayer(CALayer *container, NSString *
         }
     }
     return nil;
+}
+
+static CALayer *WKSFindNamedLayer(CALayer *container, NSString *name) {
+    if (!container || name.length == 0) {
+        return nil;
+    }
+    for (CALayer *sub in container.sublayers) {
+        if ([sub.name isEqualToString:name]) {
+            return sub;
+        }
+    }
+    return nil;
+}
+
+static NSString *WKSKeyboardSkinBackgroundPath(BOOL darkMode) {
+    NSString *fileName = darkMode ? @"bda_back_dark.png" : @"bda_back_light.png";
+    NSArray<NSString *> *candidates = @[
+        [@"/var/jb/Library/Application Support/WeChatKeyboardSwitch" stringByAppendingPathComponent:fileName],
+        [@"/Library/Application Support/WeChatKeyboardSwitch" stringByAppendingPathComponent:fileName]
+    ];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    for (NSString *path in candidates) {
+        if ([fm fileExistsAtPath:path]) {
+            return path;
+        }
+    }
+    return nil;
+}
+
+static BOOL WKSSystemPrefersDarkAppearance(void) {
+    NSString *style = [[NSUserDefaults standardUserDefaults] stringForKey:@"AppleInterfaceStyle"];
+    if (![style isKindOfClass:[NSString class]]) {
+        return NO;
+    }
+    return [style caseInsensitiveCompare:@"dark"] == NSOrderedSame;
+}
+
+static BOOL WKSReadKeyboardThemeDarkAppearance(BOOL *darkModeOut) {
+    Class colorClass = objc_getClass("WBColor");
+    if (!colorClass || ![colorClass respondsToSelector:@selector(isDarkTheme)]) {
+        return NO;
+    }
+    BOOL dark = NO;
+    @try {
+        dark = ((BOOL (*)(id, SEL))objc_msgSend)(colorClass, @selector(isDarkTheme));
+    } @catch (__unused NSException *e) {
+        return NO;
+    }
+    if (darkModeOut) {
+        *darkModeOut = dark;
+    }
+    return YES;
+}
+
+static BOOL WKSKeyboardThemePrefersDarkAppearance(void) {
+    BOOL dark = NO;
+    if (WKSReadKeyboardThemeDarkAppearance(&dark)) {
+        return dark;
+    }
+    return WKSSystemPrefersDarkAppearance();
+}
+
+static UIImage *WKSKeyboardSkinBackgroundImage(BOOL darkMode) {
+    static UIImage *darkImage = nil;
+    static UIImage *lightRawImage = nil;
+    if (darkMode) {
+        if (!darkImage) {
+            NSString *path = WKSKeyboardSkinBackgroundPath(YES);
+            if (path.length > 0) {
+                darkImage = [UIImage imageWithContentsOfFile:path];
+            }
+        }
+        return darkImage;
+    }
+    if (!lightRawImage) {
+        NSString *path = WKSKeyboardSkinBackgroundPath(NO);
+        if (path.length > 0) {
+            lightRawImage = [UIImage imageWithContentsOfFile:path];
+        }
+    }
+    return lightRawImage ?: darkImage;
+}
+
+static CALayer *WKSGetViewBackgroundLayer(UIView *view) {
+    if (!view) {
+        return nil;
+    }
+    @try {
+        id layerObj = [view valueForKey:@"backgroundLayer"];
+        if ([layerObj isKindOfClass:[CALayer class]]) {
+            return (CALayer *)layerObj;
+        }
+    } @catch (__unused NSException *e) {
+    }
+    return nil;
+}
+
+static UIVisualEffectView *WKSFindKeyboardNativeGlassEffectView(UIView *container) {
+    if (!container) {
+        return nil;
+    }
+    UIView *candidate = [container viewWithTag:kWKSKeyboardNativeGlassEffectTag];
+    if ([candidate isKindOfClass:[UIVisualEffectView class]]) {
+        return (UIVisualEffectView *)candidate;
+    }
+    return nil;
+}
+
+static UIImageView *WKSFindKeyboardSkinImageView(UIView *container) {
+    if (!container) {
+        return nil;
+    }
+    UIView *candidate = [container viewWithTag:kWKSKeyboardSkinImageViewTag];
+    if ([candidate isKindOfClass:[UIImageView class]]) {
+        return (UIImageView *)candidate;
+    }
+    return nil;
+}
+
+static void WKSRemoveKeyboardNativeGlassView(UIView *container) {
+    UIVisualEffectView *effectView = WKSFindKeyboardNativeGlassEffectView(container);
+    if (effectView) {
+        [effectView removeFromSuperview];
+    }
+    UIImageView *skinView = WKSFindKeyboardSkinImageView(container);
+    if (skinView) {
+        [skinView removeFromSuperview];
+    }
+    CALayer *rippleHost = WKSFindNamedLayer(container.layer, kWKSKeyboardRippleHostLayerName);
+    if (rippleHost) {
+        [rippleHost removeFromSuperlayer];
+    }
+}
+
+static UIBlurEffectStyle WKSKeyboardNativeBlurStyle(BOOL darkMode) {
+    if (@available(iOS 13.0, *)) {
+        return darkMode ? UIBlurEffectStyleSystemChromeMaterialDark
+                        : UIBlurEffectStyleSystemChromeMaterialLight;
+    }
+    return darkMode ? UIBlurEffectStyleDark : UIBlurEffectStyleLight;
+}
+
+static void WKSRemoveKeyboardGradientLayersOnly(CALayer *container) {
+    if (!container || container.sublayers.count == 0) {
+        return;
+    }
+
+    NSArray<CALayer *> *snapshot = [container.sublayers copy];
+    for (CALayer *sub in snapshot) {
+        if ([sub.name isEqualToString:kWKSKeyboardGlassFillLayerName] ||
+            [sub.name isEqualToString:kWKSKeyboardGlassGlossLayerName] ||
+            [sub.name isEqualToString:kWKSKeyboardNativeTopTintLayerName] ||
+            [sub.name isEqualToString:kWKSKeyboardSkinBackLayerName]) {
+            [sub removeFromSuperlayer];
+        }
+    }
 }
 
 static void WKSRemoveModernGlassLayers(CALayer *container) {
@@ -1521,19 +1764,18 @@ static void WKSRemoveToolbarGlassLayers(CALayer *container) {
 }
 
 static void WKSRemoveKeyboardGlassLayers(CALayer *container) {
-    if (!container || container.sublayers.count == 0) {
+    if (!container) {
         return;
     }
 
-    NSArray<CALayer *> *snapshot = [container.sublayers copy];
-    for (CALayer *sub in snapshot) {
-        if ([sub.name isEqualToString:kWKSKeyboardGlassFillLayerName] ||
-            [sub.name isEqualToString:kWKSKeyboardGlassGlossLayerName]) {
-            [sub removeFromSuperlayer];
-        }
+    WKSRemoveKeyboardGradientLayersOnly(container);
+    id delegate = container.delegate;
+    if ([delegate isKindOfClass:[UIView class]]) {
+        WKSRemoveKeyboardNativeGlassView((UIView *)delegate);
     }
 }
 
+__attribute__((unused))
 static void WKSApplyModernGlassLayers(CALayer *container, CGFloat cornerRadius) {
     if (!container) {
         return;
@@ -1555,11 +1797,20 @@ static void WKSApplyModernGlassLayers(CALayer *container, CGFloat cornerRadius) 
     fillLayer.startPoint = CGPointMake(0.0, 0.0);
     fillLayer.endPoint = CGPointMake(1.0, 1.0);
     fillLayer.locations = @[@0.0, @0.55, @1.0];
-    fillLayer.colors = @[
-        (id)[UIColor colorWithWhite:1.0 alpha:0.23].CGColor,
-        (id)[UIColor colorWithRed:0.84 green:0.92 blue:1.00 alpha:0.18].CGColor,
-        (id)[UIColor colorWithRed:0.90 green:0.98 blue:0.94 alpha:0.14].CGColor
-    ];
+    BOOL darkMode = WKSIsDarkAppearanceForLayer(container);
+    if (darkMode) {
+        fillLayer.colors = @[
+            (id)[UIColor colorWithWhite:0.08 alpha:0.84].CGColor,
+            (id)[UIColor colorWithRed:0.11 green:0.13 blue:0.18 alpha:0.76].CGColor,
+            (id)[UIColor colorWithRed:0.10 green:0.13 blue:0.11 alpha:0.72].CGColor
+        ];
+    } else {
+        fillLayer.colors = @[
+            (id)[UIColor colorWithWhite:1.0 alpha:0.23].CGColor,
+            (id)[UIColor colorWithRed:0.84 green:0.92 blue:1.00 alpha:0.18].CGColor,
+            (id)[UIColor colorWithRed:0.90 green:0.98 blue:0.94 alpha:0.14].CGColor
+        ];
+    }
 
     CAGradientLayer *glossLayer = WKSFindNamedGradientLayer(container, kWKSGlassGlossLayerName);
     if (!glossLayer) {
@@ -1572,11 +1823,19 @@ static void WKSApplyModernGlassLayers(CALayer *container, CGFloat cornerRadius) 
     glossLayer.startPoint = CGPointMake(0.5, 0.0);
     glossLayer.endPoint = CGPointMake(0.5, 1.0);
     glossLayer.locations = @[@0.0, @0.35, @1.0];
-    glossLayer.colors = @[
-        (id)[UIColor colorWithWhite:1.0 alpha:0.24].CGColor,
-        (id)[UIColor colorWithWhite:1.0 alpha:0.10].CGColor,
-        (id)[UIColor colorWithWhite:1.0 alpha:0.02].CGColor
-    ];
+    if (darkMode) {
+        glossLayer.colors = @[
+            (id)[UIColor colorWithWhite:1.0 alpha:0.12].CGColor,
+            (id)[UIColor colorWithWhite:1.0 alpha:0.05].CGColor,
+            (id)[UIColor colorWithWhite:1.0 alpha:0.01].CGColor
+        ];
+    } else {
+        glossLayer.colors = @[
+            (id)[UIColor colorWithWhite:1.0 alpha:0.24].CGColor,
+            (id)[UIColor colorWithWhite:1.0 alpha:0.10].CGColor,
+            (id)[UIColor colorWithWhite:1.0 alpha:0.02].CGColor
+        ];
+    }
 
     CAGradientLayer *borderLayer = WKSFindNamedGradientLayer(container, kWKSGlassBorderLayerName);
     if (!borderLayer) {
@@ -1588,11 +1847,19 @@ static void WKSApplyModernGlassLayers(CALayer *container, CGFloat cornerRadius) 
     borderLayer.startPoint = CGPointMake(0.0, 0.0);
     borderLayer.endPoint = CGPointMake(1.0, 1.0);
     borderLayer.locations = @[@0.0, @0.45, @1.0];
-    borderLayer.colors = @[
-        (id)[UIColor colorWithRed:0.69 green:0.91 blue:1.00 alpha:0.96].CGColor,
-        (id)[UIColor colorWithRed:0.95 green:0.88 blue:1.00 alpha:0.90].CGColor,
-        (id)[UIColor colorWithRed:0.75 green:1.00 blue:0.93 alpha:0.92].CGColor
-    ];
+    if (darkMode) {
+        borderLayer.colors = @[
+            (id)[UIColor colorWithRed:0.62 green:0.76 blue:0.90 alpha:0.42].CGColor,
+            (id)[UIColor colorWithRed:0.78 green:0.70 blue:0.90 alpha:0.34].CGColor,
+            (id)[UIColor colorWithRed:0.62 green:0.86 blue:0.76 alpha:0.36].CGColor
+        ];
+    } else {
+        borderLayer.colors = @[
+            (id)[UIColor colorWithRed:0.69 green:0.91 blue:1.00 alpha:0.96].CGColor,
+            (id)[UIColor colorWithRed:0.95 green:0.88 blue:1.00 alpha:0.90].CGColor,
+            (id)[UIColor colorWithRed:0.75 green:1.00 blue:0.93 alpha:0.92].CGColor
+        ];
+    }
 
     CAShapeLayer *mask = nil;
     if ([borderLayer.mask isKindOfClass:[CAShapeLayer class]]) {
@@ -1606,7 +1873,7 @@ static void WKSApplyModernGlassLayers(CALayer *container, CGFloat cornerRadius) 
     UIBezierPath *path = [UIBezierPath bezierPathWithRoundedRect:strokeRect cornerRadius:strokeRadius];
     mask.path = path.CGPath;
     mask.fillColor = UIColor.clearColor.CGColor;
-    mask.strokeColor = UIColor.whiteColor.CGColor;
+    mask.strokeColor = [UIColor colorWithWhite:1.0 alpha:(darkMode ? 0.54 : 1.0)].CGColor;
     mask.lineWidth = 1.2;
 }
 
@@ -1646,12 +1913,8 @@ static void WKSApplyToolbarGlassBackgroundOnView(UIView *view) {
     fillLayer.startPoint = CGPointMake(0.0, 0.0);
     fillLayer.endPoint = CGPointMake(1.0, 1.0);
     fillLayer.locations = @[@0.0, @0.33, @0.68, @1.0];
-    fillLayer.colors = @[
-        (id)[UIColor colorWithRed:0.54 green:0.85 blue:1.00 alpha:0.28].CGColor,
-        (id)[UIColor colorWithRed:0.68 green:0.63 blue:1.00 alpha:0.24].CGColor,
-        (id)[UIColor colorWithRed:0.43 green:0.95 blue:0.85 alpha:0.20].CGColor,
-        (id)[UIColor colorWithRed:1.00 green:0.79 blue:0.58 alpha:0.18].CGColor
-    ];
+    BOOL darkMode = WKSIsDarkAppearanceForView(view);
+    fillLayer.colors = WKSKeyboardGlassFillColors(darkMode);
 
     CAGradientLayer *glossLayer = WKSFindNamedGradientLayer(view.layer, kWKSToolbarGlassGlossLayerName);
     if (!glossLayer) {
@@ -1664,13 +1927,10 @@ static void WKSApplyToolbarGlassBackgroundOnView(UIView *view) {
     glossLayer.startPoint = CGPointMake(0.5, 0.0);
     glossLayer.endPoint = CGPointMake(0.5, 1.0);
     glossLayer.locations = @[@0.0, @0.3, @1.0];
-    glossLayer.colors = @[
-        (id)[UIColor colorWithWhite:1.0 alpha:0.26].CGColor,
-        (id)[UIColor colorWithWhite:1.0 alpha:0.12].CGColor,
-        (id)[UIColor colorWithWhite:1.0 alpha:0.03].CGColor
-    ];
+    glossLayer.colors = WKSKeyboardGlassGlossColors(darkMode);
 }
 
+__attribute__((unused))
 static void WKSApplyKeyboardGlassBackgroundOnView(UIView *view) {
     if (!view) {
         return;
@@ -1699,12 +1959,8 @@ static void WKSApplyKeyboardGlassBackgroundOnView(UIView *view) {
     fillLayer.startPoint = CGPointMake(0.0, 0.0);
     fillLayer.endPoint = CGPointMake(1.0, 1.0);
     fillLayer.locations = @[@0.0, @0.33, @0.68, @1.0];
-    fillLayer.colors = @[
-        (id)[UIColor colorWithRed:0.54 green:0.85 blue:1.00 alpha:0.28].CGColor,
-        (id)[UIColor colorWithRed:0.68 green:0.63 blue:1.00 alpha:0.24].CGColor,
-        (id)[UIColor colorWithRed:0.43 green:0.95 blue:0.85 alpha:0.20].CGColor,
-        (id)[UIColor colorWithRed:1.00 green:0.79 blue:0.58 alpha:0.18].CGColor
-    ];
+    BOOL darkMode = WKSKeyboardThemePrefersDarkAppearance();
+    fillLayer.colors = WKSKeyboardGlassFillColors(darkMode);
 
     CAGradientLayer *glossLayer = WKSFindNamedGradientLayer(view.layer, kWKSKeyboardGlassGlossLayerName);
     if (!glossLayer) {
@@ -1717,11 +1973,7 @@ static void WKSApplyKeyboardGlassBackgroundOnView(UIView *view) {
     glossLayer.startPoint = CGPointMake(0.5, 0.0);
     glossLayer.endPoint = CGPointMake(0.5, 1.0);
     glossLayer.locations = @[@0.0, @0.3, @1.0];
-    glossLayer.colors = @[
-        (id)[UIColor colorWithWhite:1.0 alpha:0.26].CGColor,
-        (id)[UIColor colorWithWhite:1.0 alpha:0.12].CGColor,
-        (id)[UIColor colorWithWhite:1.0 alpha:0.03].CGColor
-    ];
+    glossLayer.colors = WKSKeyboardGlassGlossColors(darkMode);
 }
 
 static UIView *WKSFindToolbarViewInTree(UIView *root, int depth) {
@@ -1754,53 +2006,242 @@ static UIView *WKSCommonAncestorView(UIView *a, UIView *b) {
     return nil;
 }
 
-static void WKSApplyKeyboardGlassBackgroundInView(UIView *view, CGRect renderRect, CGFloat cornerRadius) {
+static UIView *WKSFindWiderGlassPaintView(UIView *baseView, CGFloat minRequiredHeight) {
+    if (!baseView || CGRectIsEmpty(baseView.bounds)) {
+        return baseView;
+    }
+
+    (void)minRequiredHeight;
+
+    // 直接上提到窗口前一层，确保键盘缩放后两侧露白仍被同一背景覆盖。
+    UIView *top = baseView;
+    UIView *cursor = baseView;
+    for (int i = 0; cursor && i < 12; i++) {
+        UIView *sup = cursor.superview;
+        if (!sup || [sup isKindOfClass:[UIWindow class]]) {
+            break;
+        }
+        if (!CGRectIsEmpty(sup.bounds) && sup.bounds.size.width >= 24.0 && sup.bounds.size.height >= 24.0) {
+            top = sup;
+        }
+        cursor = sup;
+    }
+    return top ?: baseView;
+}
+
+static void WKSCollectKeyRectsInView(UIView *root, UIView *convertTo,
+                                     NSMutableArray<NSValue *> *rects, int depth) {
+    if (!root || !convertTo || !rects || depth > 9) {
+        return;
+    }
+
+    if (WKSIsKeyViewLike(root) && !root.hidden && root.alpha > 0.01f) {
+        CGRect rect = [root convertRect:root.bounds toView:convertTo];
+        if (!CGRectIsEmpty(rect) && rect.size.width >= 12.0 && rect.size.height >= 12.0) {
+            [rects addObject:[NSValue valueWithCGRect:rect]];
+        }
+    }
+
+    for (UIView *sub in root.subviews) {
+        WKSCollectKeyRectsInView(sub, convertTo, rects, depth + 1);
+    }
+}
+
+static BOOL WKSBuildToolbarFirstRowGlassRect(UIView *common,
+                                             UIView *hostingView,
+                                             UIView *toolbarView,
+                                             CGRect *outRect) {
+    if (!common || !hostingView || !toolbarView || !outRect) {
+        return NO;
+    }
+
+    CGRect commonBounds = common.bounds;
+    CGRect hostRect = [hostingView convertRect:hostingView.bounds toView:common];
+    CGRect toolbarRect = [toolbarView convertRect:toolbarView.bounds toView:common];
+    if (CGRectIsEmpty(commonBounds) || CGRectIsEmpty(hostRect) || CGRectIsEmpty(toolbarRect)) {
+        return NO;
+    }
+
+    NSMutableArray<NSValue *> *keyRects = [NSMutableArray array];
+    WKSCollectKeyRectsInView(hostingView, common, keyRects, 0);
+
+    CGFloat hostMinY = CGRectGetMinY(hostRect);
+    CGFloat hostMaxY = CGRectGetMaxY(hostRect);
+    CGFloat minKeyY = CGFLOAT_MAX;
+
+    for (NSValue *value in keyRects) {
+        CGRect keyRect = value.CGRectValue;
+        if (CGRectIsEmpty(keyRect)) {
+            continue;
+        }
+        CGFloat y = CGRectGetMinY(keyRect);
+        if (y < (hostMinY - 1.0) || y > (hostMaxY + 1.0)) {
+            continue;
+        }
+        if (y < minKeyY) {
+            minKeyY = y;
+        }
+    }
+
+    CGFloat firstRowTop = hostMinY;
+    CGFloat firstRowBottom = hostMinY + MAX(56.0, MIN(hostRect.size.height * 0.24, 116.0));
+    if (minKeyY != CGFLOAT_MAX) {
+        firstRowTop = MAX(hostMinY, minKeyY);
+        CGFloat rowTolerance = MAX(18.0, MIN(30.0, hostRect.size.height * 0.05));
+        firstRowBottom = firstRowTop;
+        for (NSValue *value in keyRects) {
+            CGRect keyRect = value.CGRectValue;
+            if (CGRectIsEmpty(keyRect)) {
+                continue;
+            }
+            if (CGRectGetMinY(keyRect) <= (firstRowTop + rowTolerance)) {
+                firstRowBottom = MAX(firstRowBottom, CGRectGetMaxY(keyRect));
+            }
+        }
+    }
+
+    firstRowBottom = MIN(hostMaxY, firstRowBottom);
+    if (firstRowBottom <= firstRowTop + 4.0) {
+        return NO;
+    }
+
+    CGRect firstRowRect = CGRectMake(hostRect.origin.x,
+                                     firstRowTop,
+                                     hostRect.size.width,
+                                     firstRowBottom - firstRowTop);
+    CGRect topGlassRect = CGRectUnion(toolbarRect, firstRowRect);
+    CGRect clipped = CGRectIntersection(topGlassRect, commonBounds);
+    if (CGRectIsEmpty(clipped) || clipped.size.width < 24.0 || clipped.size.height < 24.0) {
+        return NO;
+    }
+    *outRect = clipped;
+    return YES;
+}
+
+static void WKSApplyKeyboardGlassBackgroundInView(UIView *view, CGRect renderRect, CGFloat cornerRadius, CGFloat toolbarTintHeight) {
     if (!view) {
         return;
     }
+    (void)toolbarTintHeight;
+    CAGradientLayer *topTintLayer = WKSFindNamedGradientLayer(view.layer, kWKSKeyboardNativeTopTintLayerName);
     if (CGRectIsEmpty(renderRect) || renderRect.size.width < 24.0 || renderRect.size.height < 24.0) {
-        WKSRemoveKeyboardGlassLayers(view.layer);
+        if (topTintLayer) {
+            [topTintLayer removeFromSuperlayer];
+        }
+        CALayer *skinLayer = WKSFindNamedLayer(view.layer, kWKSKeyboardSkinBackLayerName);
+        if (skinLayer) {
+            [skinLayer removeFromSuperlayer];
+        }
+        CALayer *rippleHostLayer = WKSFindNamedLayer(view.layer, kWKSKeyboardRippleHostLayerName);
+        if (rippleHostLayer) {
+            [rippleHostLayer removeFromSuperlayer];
+        }
+        WKSRemoveKeyboardGradientLayersOnly(view.layer);
+        WKSRemoveKeyboardNativeGlassView(view);
         return;
     }
 
     view.opaque = NO;
     view.backgroundColor = UIColor.clearColor;
     view.layer.backgroundColor = UIColor.clearColor.CGColor;
+    BOOL darkMode = WKSIsDarkAppearanceForView(view);
+    WKSRemoveKeyboardGradientLayersOnly(view.layer);
 
-    CAGradientLayer *fillLayer = WKSFindNamedGradientLayer(view.layer, kWKSKeyboardGlassFillLayerName);
-    if (!fillLayer) {
-        fillLayer = [CAGradientLayer layer];
-        fillLayer.name = kWKSKeyboardGlassFillLayerName;
-        [view.layer insertSublayer:fillLayer atIndex:0];
+    UIVisualEffectView *effectView = WKSFindKeyboardNativeGlassEffectView(view);
+    if (!effectView) {
+        effectView = [[UIVisualEffectView alloc] initWithEffect:nil];
+        effectView.tag = kWKSKeyboardNativeGlassEffectTag;
+        effectView.userInteractionEnabled = NO;
+        [view insertSubview:effectView atIndex:0];
+    } else if (effectView.superview != view) {
+        [effectView removeFromSuperview];
+        [view insertSubview:effectView atIndex:0];
     }
-    fillLayer.frame = renderRect;
-    fillLayer.cornerRadius = cornerRadius;
-    fillLayer.startPoint = CGPointMake(0.0, 0.0);
-    fillLayer.endPoint = CGPointMake(1.0, 1.0);
-    fillLayer.locations = @[@0.0, @0.33, @0.68, @1.0];
-    fillLayer.colors = @[
-        (id)[UIColor colorWithRed:0.54 green:0.85 blue:1.00 alpha:0.28].CGColor,
-        (id)[UIColor colorWithRed:0.68 green:0.63 blue:1.00 alpha:0.24].CGColor,
-        (id)[UIColor colorWithRed:0.43 green:0.95 blue:0.85 alpha:0.20].CGColor,
-        (id)[UIColor colorWithRed:1.00 green:0.79 blue:0.58 alpha:0.18].CGColor
-    ];
+    effectView.effect = [UIBlurEffect effectWithStyle:WKSKeyboardNativeBlurStyle(darkMode)];
+    effectView.frame = renderRect;
+    effectView.alpha = 0.0;
+    effectView.clipsToBounds = YES;
+    effectView.layer.cornerRadius = cornerRadius;
+    effectView.layer.masksToBounds = YES;
 
-    CAGradientLayer *glossLayer = WKSFindNamedGradientLayer(view.layer, kWKSKeyboardGlassGlossLayerName);
-    if (!glossLayer) {
-        glossLayer = [CAGradientLayer layer];
-        glossLayer.name = kWKSKeyboardGlassGlossLayerName;
-        [view.layer addSublayer:glossLayer];
+    UIView *tintView = [effectView.contentView viewWithTag:kWKSKeyboardNativeGlassTintTag];
+    if (!tintView) {
+        tintView = [[UIView alloc] initWithFrame:effectView.contentView.bounds];
+        tintView.tag = kWKSKeyboardNativeGlassTintTag;
+        tintView.userInteractionEnabled = NO;
+        tintView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        [effectView.contentView addSubview:tintView];
     }
-    glossLayer.frame = renderRect;
-    glossLayer.cornerRadius = cornerRadius;
-    glossLayer.startPoint = CGPointMake(0.5, 0.0);
-    glossLayer.endPoint = CGPointMake(0.5, 1.0);
-    glossLayer.locations = @[@0.0, @0.3, @1.0];
-    glossLayer.colors = @[
-        (id)[UIColor colorWithWhite:1.0 alpha:0.26].CGColor,
-        (id)[UIColor colorWithWhite:1.0 alpha:0.12].CGColor,
-        (id)[UIColor colorWithWhite:1.0 alpha:0.03].CGColor
-    ];
+    tintView.frame = effectView.contentView.bounds;
+    tintView.backgroundColor = UIColor.clearColor;
+    UIImage *skinImage = WKSKeyboardSkinBackgroundImage(darkMode);
+    UIImageView *skinView = WKSFindKeyboardSkinImageView(view);
+    if (skinImage) {
+        if (!skinView) {
+            skinView = [[UIImageView alloc] initWithFrame:renderRect];
+            skinView.tag = kWKSKeyboardSkinImageViewTag;
+            skinView.userInteractionEnabled = NO;
+            [view insertSubview:skinView atIndex:0];
+        } else if (skinView.superview != view) {
+            [skinView removeFromSuperview];
+            [view insertSubview:skinView atIndex:0];
+        }
+        skinView.frame = renderRect;
+        skinView.image = skinImage;
+        skinView.alpha = 1.0;
+        skinView.backgroundColor = UIColor.clearColor;
+        skinView.contentMode = UIViewContentModeScaleToFill;
+        skinView.clipsToBounds = YES;
+        skinView.layer.cornerRadius = cornerRadius;
+        skinView.layer.masksToBounds = YES;
+    } else if (skinView) {
+        [skinView removeFromSuperview];
+    }
+
+    CALayer *hostBackgroundLayer = WKSGetViewBackgroundLayer(view);
+    if (hostBackgroundLayer) {
+        if (skinImage.CGImage) {
+            hostBackgroundLayer.contents = (__bridge id)skinImage.CGImage;
+            hostBackgroundLayer.contentsGravity = kCAGravityResize;
+            hostBackgroundLayer.contentsRect = CGRectMake(0.0, 0.0, 1.0, 1.0);
+            hostBackgroundLayer.contentsScale = UIScreen.mainScreen.scale;
+            hostBackgroundLayer.backgroundColor = UIColor.clearColor.CGColor;
+        } else {
+            hostBackgroundLayer.contents = nil;
+        }
+    }
+
+    CALayer *skinLayer = WKSFindNamedLayer(view.layer, kWKSKeyboardSkinBackLayerName);
+    CALayer *rippleHostLayer = WKSFindNamedLayer(view.layer, kWKSKeyboardRippleHostLayerName);
+    if (skinImage.CGImage) {
+        if (!skinLayer) {
+            skinLayer = [CALayer layer];
+            skinLayer.name = kWKSKeyboardSkinBackLayerName;
+            [view.layer insertSublayer:skinLayer atIndex:0];
+        }
+        skinLayer.frame = renderRect;
+        skinLayer.contents = (__bridge id)skinImage.CGImage;
+        skinLayer.contentsGravity = kCAGravityResize;
+        skinLayer.contentsRect = CGRectMake(0.0, 0.0, 1.0, 1.0);
+        skinLayer.contentsScale = UIScreen.mainScreen.scale;
+        skinLayer.opacity = 1.0f;
+        skinLayer.backgroundColor = UIColor.clearColor.CGColor;
+        skinLayer.cornerRadius = cornerRadius;
+        skinLayer.masksToBounds = YES;
+        if (rippleHostLayer) {
+            [rippleHostLayer removeFromSuperlayer];
+        }
+    } else if (skinLayer) {
+        [skinLayer removeFromSuperlayer];
+        if (rippleHostLayer) {
+            [rippleHostLayer removeFromSuperlayer];
+        }
+    } else if (rippleHostLayer) {
+        [rippleHostLayer removeFromSuperlayer];
+    }
+    if (topTintLayer) {
+        [topTintLayer removeFromSuperlayer];
+    }
 }
 
 static UIView *WKSFindKeyboardBackgroundContainerView(id panelObj, UIView **hostingOut) {
@@ -1839,6 +2280,315 @@ static UIView *WKSFindKeyboardBackgroundContainerView(id panelObj, UIView **host
     return container;
 }
 
+static NSString *WKSKeyboardSupportDirectoryPath(void) {
+    static NSString *cached = nil;
+    if (cached.length > 0) {
+        return cached;
+    }
+    NSArray<NSString *> *candidates = @[
+        @"/var/jb/Library/Application Support/WeChatKeyboardSwitch",
+        @"/Library/Application Support/WeChatKeyboardSwitch"
+    ];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    for (NSString *path in candidates) {
+        BOOL isDir = NO;
+        if ([fm fileExistsAtPath:path isDirectory:&isDir] && isDir) {
+            cached = [path copy];
+            return cached;
+        }
+    }
+    return nil;
+}
+
+static NSString *WKSKeyboardRipplePrefixFromString(NSString *value) {
+    if (value.length == 0) {
+        return nil;
+    }
+    NSString *lower = value.lowercaseString;
+    for (NSUInteger i = 0; i < lower.length; i++) {
+        unichar ch = [lower characterAtIndex:i];
+        if (ch >= 'a' && ch <= 'z') {
+            return [NSString stringWithCharacters:&ch length:1];
+        }
+    }
+    return nil;
+}
+
+static NSString *WKSKeyboardRipplePrefixForKeyView(id keyView) {
+    if (!keyView) {
+        return nil;
+    }
+
+    NSArray<NSString *> *directKeys = @[@"defaultInputForNormalState", @"defaultTitle", @"title", @"input"];
+    for (NSString *key in directKeys) {
+        NSString *prefix = WKSKeyboardRipplePrefixFromString(WKSStringForKVC(keyView, key));
+        if (prefix.length == 1) {
+            return prefix;
+        }
+    }
+
+    id item = nil;
+    @try {
+        item = [keyView valueForKey:@"item"];
+    } @catch (__unused NSException *e) {
+    }
+    NSArray<NSString *> *itemKeys = @[@"input", @"upInput", @"title", @"identifier"];
+    for (NSString *key in itemKeys) {
+        NSString *prefix = WKSKeyboardRipplePrefixFromString(WKSStringForKVC(item, key));
+        if (prefix.length == 1) {
+            return prefix;
+        }
+    }
+    return nil;
+}
+
+static NSArray *WKSKeyboardRippleFrameCGImages(NSString *prefix, BOOL darkMode) {
+    static NSCache<NSString *, NSArray *> *cache = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        cache = [[NSCache alloc] init];
+        cache.countLimit = 4;
+        cache.totalCostLimit = (NSUInteger)(40 * 1024 * 1024);
+    });
+
+    NSString *setKey = (prefix.length == 1) ? prefix.lowercaseString : @"_default";
+    NSString *cacheKey = [NSString stringWithFormat:@"%@:%@", darkMode ? @"d" : @"l", setKey];
+    NSArray *cached = [cache objectForKey:cacheKey];
+    if (cached.count > 1) {
+        return cached;
+    }
+
+    NSString *baseDir = WKSKeyboardSupportDirectoryPath();
+    if (baseDir.length == 0) {
+        return @[];
+    }
+
+    NSArray<NSDictionary<NSString *, id> *> *attempts = @[
+        @{@"dark": @(darkMode), @"set": setKey},
+        @{@"dark": @(darkMode), @"set": @"_default"},
+        @{@"dark": @(!darkMode), @"set": setKey},
+        @{@"dark": @(!darkMode), @"set": @"_default"}
+    ];
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray *values = nil;
+    for (NSDictionary<NSString *, id> *attempt in attempts) {
+        BOOL attemptDark = [attempt[@"dark"] boolValue];
+        NSString *attemptSet = attempt[@"set"];
+        NSString *attemptCacheKey = [NSString stringWithFormat:@"%@:%@",
+                                     attemptDark ? @"d" : @"l", attemptSet];
+        NSArray *attemptCached = [cache objectForKey:attemptCacheKey];
+        if (attemptCached.count > 1) {
+            values = attemptCached;
+            break;
+        }
+
+        NSString *folder = attemptDark ? @"llee_dark" : @"llee_light";
+        NSMutableArray *tmp = [NSMutableArray arrayWithCapacity:31];
+        NSUInteger byteCost = 0;
+        for (NSInteger idx = 0; idx <= 30; idx++) {
+            NSString *name = [attemptSet isEqualToString:@"_default"]
+                ? [NSString stringWithFormat:@"lleeimage_%ld.png", (long)idx]
+                : [NSString stringWithFormat:@"%@_lleeimage_%ld.png", attemptSet, (long)idx];
+            NSString *path = [[baseDir stringByAppendingPathComponent:folder]
+                              stringByAppendingPathComponent:name];
+            if (![fm fileExistsAtPath:path]) {
+                continue;
+            }
+
+            UIImage *raw = [UIImage imageWithContentsOfFile:path];
+            if (!raw.CGImage) {
+                continue;
+            }
+
+            // 压缩到较小尺寸后再入缓存，避免快打时内存暴涨导致崩溃。
+            CGSize rawSize = raw.size;
+            CGFloat maxSide = MAX(rawSize.width, rawSize.height);
+            UIImage *prepared = raw;
+            if (maxSide > 280.0) {
+                CGFloat ratio = 280.0 / maxSide;
+                CGSize target = CGSizeMake(MAX(1.0, floor(rawSize.width * ratio)),
+                                           MAX(1.0, floor(rawSize.height * ratio)));
+                UIGraphicsBeginImageContextWithOptions(target, NO, 1.0);
+                [raw drawInRect:CGRectMake(0.0, 0.0, target.width, target.height)];
+                UIImage *scaled = UIGraphicsGetImageFromCurrentImageContext();
+                UIGraphicsEndImageContext();
+                if (scaled.CGImage) {
+                    prepared = scaled;
+                }
+            }
+
+            if (prepared.CGImage) {
+                [tmp addObject:(__bridge id)prepared.CGImage];
+                CGSize sz = prepared.size;
+                byteCost += (NSUInteger)(MAX(1.0, sz.width) * MAX(1.0, sz.height) * 4.0);
+            }
+        }
+
+        if (tmp.count > 1) {
+            values = [tmp copy];
+            [cache setObject:values forKey:attemptCacheKey cost:byteCost];
+            break;
+        }
+    }
+    if (values.count < 2) {
+        return @[];
+    }
+    return values;
+}
+
+static UIView *WKSFindKeyboardRipplePaintViewAroundPanel(UIView *panelView, CALayer **rippleHostLayerOut) {
+    if (rippleHostLayerOut) {
+        *rippleHostLayerOut = nil;
+    }
+    if (!panelView) {
+        return nil;
+    }
+
+    UIView *cursor = panelView;
+    for (int i = 0; cursor && i < 14; i++) {
+        // 清理旧版本可能挂在父层的波纹宿主，避免在按钮前景层可见。
+        CALayer *legacyHost = WKSFindNamedLayer(cursor.layer, kWKSKeyboardRippleHostLayerName);
+        if (legacyHost) {
+            [legacyHost removeFromSuperlayer];
+        }
+
+        UIView *candidate = [cursor viewWithTag:kWKSKeyboardSkinImageViewTag];
+        if ([candidate isKindOfClass:[UIImageView class]]) {
+            UIImageView *skinView = (UIImageView *)candidate;
+            CALayer *rippleLayer = WKSFindNamedLayer(skinView.layer, kWKSKeyboardRippleHostLayerName);
+            if (!rippleLayer) {
+                rippleLayer = [CALayer layer];
+                rippleLayer.name = kWKSKeyboardRippleHostLayerName;
+                rippleLayer.backgroundColor = UIColor.clearColor.CGColor;
+                [skinView.layer addSublayer:rippleLayer];
+            }
+            rippleLayer.frame = skinView.bounds;
+            rippleLayer.cornerRadius = skinView.layer.cornerRadius;
+            rippleLayer.masksToBounds = YES;
+            if (rippleHostLayerOut) {
+                *rippleHostLayerOut = rippleLayer;
+            }
+            return skinView;
+        }
+        cursor = cursor.superview;
+    }
+    return nil;
+}
+
+static void WKSShowKeyboardTouchRipple(id panel, id touch) {
+    if (!panel || !touch || ![panel isKindOfClass:[UIView class]]) {
+        return;
+    }
+
+    CGPoint pointInPanel = CGPointZero;
+    if (!WKSGetTouchLocationInPanel(touch, panel, &pointInPanel)) {
+        return;
+    }
+
+    UIView *panelView = (UIView *)panel;
+    CALayer *rippleHostLayer = nil;
+    UIView *paintView = WKSFindKeyboardRipplePaintViewAroundPanel(panelView, &rippleHostLayer);
+    if (!paintView || !rippleHostLayer ||
+        rippleHostLayer.bounds.size.width < 20.0 || rippleHostLayer.bounds.size.height < 20.0) {
+        return;
+    }
+
+    CGPoint pointInPaint = [panelView convertPoint:pointInPanel toView:paintView];
+    CGPoint pointInHost = CGPointMake(pointInPaint.x - CGRectGetMinX(rippleHostLayer.frame),
+                                      pointInPaint.y - CGRectGetMinY(rippleHostLayer.frame));
+    if (!CGRectContainsPoint(rippleHostLayer.bounds, pointInHost)) {
+        return;
+    }
+
+    CGFloat effectSize = 340.0;
+    id keyView = WKSGetKeyViewFromTouch(panel, touch);
+    BOOL darkMode = WKSIsDarkAppearanceForView(paintView);
+    NSString *prefix = WKSKeyboardRipplePrefixForKeyView(keyView);
+    NSArray *frameValues = WKSKeyboardRippleFrameCGImages(prefix, darkMode);
+    if (frameValues.count < 2) {
+        return;
+    }
+    if ([keyView isKindOfClass:[UIView class]]) {
+        CGRect keyRect = [(UIView *)keyView convertRect:((UIView *)keyView).bounds toView:paintView];
+        CGFloat keySide = MAX(CGRectGetWidth(keyRect), CGRectGetHeight(keyRect));
+        if (keySide > 1.0) {
+            effectSize = MIN(430.0, MAX(220.0, keySide * 3.7));
+        }
+    }
+
+    NSArray *renderFrames = frameValues;
+    if (frameValues.count > 4) {
+        renderFrames = [frameValues subarrayWithRange:NSMakeRange(1, frameValues.count - 2)];
+    }
+    if (renderFrames.count < 2) {
+        renderFrames = frameValues;
+    }
+
+    CALayer *rippleLayer = [CALayer layer];
+    rippleLayer.frame = CGRectMake(pointInHost.x - effectSize * 0.5,
+                                   pointInHost.y - effectSize * 0.5,
+                                   effectSize, effectSize);
+    rippleLayer.contentsScale = UIScreen.mainScreen.scale;
+    rippleLayer.contentsGravity = kCAGravityResizeAspectFill;
+    CGFloat baseOpacity = darkMode ? 0.58f : 0.80f;
+    rippleLayer.opacity = 0.0f;
+    rippleLayer.contents = renderFrames.firstObject;
+    rippleLayer.transform = CATransform3DMakeScale(0.94, 0.94, 1.0);
+    [rippleHostLayer addSublayer:rippleLayer];
+
+    while (rippleHostLayer.sublayers.count > 10) {
+        CALayer *oldest = rippleHostLayer.sublayers.firstObject;
+        if (!oldest || oldest == rippleLayer) {
+            break;
+        }
+        [oldest removeFromSuperlayer];
+    }
+
+    CAKeyframeAnimation *contentsAnim = [CAKeyframeAnimation animationWithKeyPath:@"contents"];
+    contentsAnim.values = renderFrames;
+    contentsAnim.calculationMode = kCAAnimationDiscrete;
+    contentsAnim.duration = 0.66;
+    contentsAnim.removedOnCompletion = YES;
+
+    CAKeyframeAnimation *alphaAnim = [CAKeyframeAnimation animationWithKeyPath:@"opacity"];
+    alphaAnim.values = @[@0.0, @(baseOpacity * 0.38), @(baseOpacity), @(baseOpacity * 0.45), @0.0];
+    alphaAnim.keyTimes = @[@0.0, @0.30, @0.62, @0.86, @1.0];
+    alphaAnim.duration = 0.66;
+    alphaAnim.timingFunctions = @[
+        [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut],
+        [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut],
+        [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseIn]
+    ];
+    alphaAnim.removedOnCompletion = YES;
+
+    CAKeyframeAnimation *scaleAnim = [CAKeyframeAnimation animationWithKeyPath:@"transform.scale"];
+    scaleAnim.values = @[@0.94, @1.00, @1.06];
+    scaleAnim.keyTimes = @[@0.0, @0.40, @1.0];
+    scaleAnim.duration = 0.66;
+    scaleAnim.timingFunctions = @[
+        [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut],
+        [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut]
+    ];
+    scaleAnim.removedOnCompletion = YES;
+
+    CAAnimationGroup *group = [CAAnimationGroup animation];
+    group.animations = @[contentsAnim, alphaAnim, scaleAnim];
+    group.duration = 0.66;
+    group.removedOnCompletion = YES;
+
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    [CATransaction setCompletionBlock:^{
+        [rippleLayer removeFromSuperlayer];
+    }];
+    [rippleLayer addAnimation:group forKey:@"wks_keyboard_ripple"];
+    rippleLayer.contents = renderFrames.lastObject;
+    rippleLayer.opacity = 0.0f;
+    rippleLayer.transform = CATransform3DMakeScale(1.06, 1.06, 1.0);
+    [CATransaction commit];
+}
+
 static void WKSApplyKeyboardGlassBackgroundForPanel(id panelObj) {
     if (!panelObj) {
         return;
@@ -1862,18 +2612,59 @@ static void WKSApplyKeyboardGlassBackgroundForPanel(id panelObj) {
     if (hostingView && toolbarView) {
         UIView *common = WKSCommonAncestorView(hostingView, toolbarView);
         if (common && !CGRectIsEmpty(common.bounds)) {
-            CGRect hostRect = [hostingView convertRect:hostingView.bounds toView:common];
-            CGRect toolbarRect = [toolbarView convertRect:toolbarView.bounds toView:common];
-            CGRect unionRect = CGRectUnion(hostRect, toolbarRect);
-            CGRect clipped = CGRectIntersection(unionRect, common.bounds);
-            if (!CGRectIsEmpty(clipped) && clipped.size.width > 24.0 && clipped.size.height > 24.0) {
-                if (hostingView != common) {
+            CGRect clipped = CGRectZero;
+            if (WKSBuildToolbarFirstRowGlassRect(common, hostingView, toolbarView, &clipped)) {
+                UIView *paintView = WKSFindWiderGlassPaintView(common, CGRectGetMaxY(clipped));
+                CGRect paintRect = clipped;
+                if (paintView && paintView != common) {
+                    paintRect = [common convertRect:clipped toView:paintView];
+                    paintRect.origin.x = 0.0;
+                    paintRect.size.width = paintView.bounds.size.width;
+                    paintRect = CGRectIntersection(paintRect, paintView.bounds);
+                    if (CGRectIsEmpty(paintRect) || paintRect.size.width < 24.0 || paintRect.size.height < 24.0) {
+                        paintView = common;
+                        paintRect = clipped;
+                    }
+                } else {
+                    paintView = common;
+                }
+                if (!CGRectIsEmpty(paintRect)) {
+                    paintRect.size.height = MAX(0.0, paintView.bounds.size.height - paintRect.origin.y);
+                }
+                if (CGRectIsEmpty(paintRect) || paintRect.size.width < 24.0 || paintRect.size.height < 24.0) {
+                    paintRect = paintView.bounds;
+                }
+
+                if (hostingView != paintView) {
                     WKSRemoveKeyboardGlassLayers(hostingView.layer);
                 }
-                if (targetView != common) {
+                if (targetView != paintView) {
                     WKSRemoveKeyboardGlassLayers(targetView.layer);
                 }
-                WKSApplyKeyboardGlassBackgroundInView(common, clipped, 14.0);
+                if (common != paintView) {
+                    WKSRemoveKeyboardGlassLayers(common.layer);
+                }
+                if (toolbarView != paintView) {
+                    WKSRemoveToolbarGlassLayers(toolbarView.layer);
+                    WKSRemoveModernGlassLayers(toolbarView.layer);
+                }
+                CGFloat toolbarTintHeight = 0.0;
+                CGRect topBandRectInPaint = [common convertRect:clipped toView:paintView];
+                CGRect topBandInRender = CGRectIntersection(topBandRectInPaint, paintRect);
+                if (!CGRectIsEmpty(topBandInRender)) {
+                    toolbarTintHeight = CGRectGetMaxY(topBandInRender) - paintRect.origin.y;
+                    toolbarTintHeight = MIN(paintRect.size.height,
+                                            MAX(topBandInRender.size.height, toolbarTintHeight));
+                } else {
+                    CGRect toolbarRectInPaint = [toolbarView convertRect:toolbarView.bounds toView:paintView];
+                    CGRect toolbarInRender = CGRectIntersection(toolbarRectInPaint, paintRect);
+                    if (!CGRectIsEmpty(toolbarInRender)) {
+                        toolbarTintHeight = CGRectGetMaxY(toolbarInRender) - paintRect.origin.y;
+                        toolbarTintHeight = MIN(paintRect.size.height,
+                                                MAX(toolbarInRender.size.height, toolbarTintHeight));
+                    }
+                }
+                WKSApplyKeyboardGlassBackgroundInView(paintView, paintRect, 0.0, toolbarTintHeight);
                 return;
             }
         }
@@ -1882,7 +2673,26 @@ static void WKSApplyKeyboardGlassBackgroundForPanel(id panelObj) {
     if (hostingView && targetView != hostingView) {
         WKSRemoveKeyboardGlassLayers(hostingView.layer);
     }
-    WKSApplyKeyboardGlassBackgroundOnView(targetView);
+    CGRect fallbackRect = targetView.bounds;
+    UIView *fallbackView = WKSFindWiderGlassPaintView(targetView, CGRectGetMaxY(fallbackRect));
+    CGRect fallbackPaint = fallbackRect;
+    if (fallbackView && fallbackView != targetView) {
+        fallbackPaint = [targetView convertRect:fallbackRect toView:fallbackView];
+        fallbackPaint.origin.x = 0.0;
+        fallbackPaint.size.width = fallbackView.bounds.size.width;
+        fallbackPaint.origin.y = MAX(0.0, fallbackPaint.origin.y);
+        fallbackPaint.size.height = MAX(0.0, fallbackView.bounds.size.height - fallbackPaint.origin.y);
+        fallbackPaint = CGRectIntersection(fallbackPaint, fallbackView.bounds);
+        if (CGRectIsEmpty(fallbackPaint) || fallbackPaint.size.width < 24.0 || fallbackPaint.size.height < 24.0) {
+            fallbackView = targetView;
+            fallbackPaint = fallbackRect;
+        }
+        WKSRemoveKeyboardGlassLayers(targetView.layer);
+    } else {
+        fallbackView = targetView;
+        fallbackPaint = fallbackView.bounds;
+    }
+    WKSApplyKeyboardGlassBackgroundInView(fallbackView, fallbackPaint, 0.0, 0.0);
 }
 
 static BOOL WKSIsKeyViewLike(UIView *view) {
@@ -2347,6 +3157,9 @@ static void WKSPanelProcessTouchBegan(id self, SEL _cmd, id touch, id keyView) {
     if (gOrigPanelProcessTouchBegan) {
         gOrigPanelProcessTouchBegan(self, _cmd, touch, keyView);
     }
+    if (!keepNativeSwipe) {
+        WKSShowKeyboardTouchRipple(self, touch);
+    }
 }
 
 static void WKSPanelProcessTouchMoved(id self, SEL _cmd, id touch, id keyView) {
@@ -2728,6 +3541,7 @@ static void WKSPanelLayoutSubviews(id self, SEL _cmd) {
     if (gOrigPanelLayoutSubviews) {
         gOrigPanelLayoutSubviews(self, _cmd);
     }
+    WKSApplyToolbarTransparency(self);
     WKSApplyKeyboardGlassBackgroundForPanel(self);
 }
 
@@ -2735,6 +3549,7 @@ static void WKST9LayoutSubviews(id self, SEL _cmd) {
     if (gOrigT9LayoutSubviews) {
         gOrigT9LayoutSubviews(self, _cmd);
     }
+    WKSApplyToolbarTransparency(self);
     WKSApplyKeyboardGlassBackgroundForPanel(self);
 }
 
@@ -2742,6 +3557,7 @@ static void WKST26LayoutSubviews(id self, SEL _cmd) {
     if (gOrigT26LayoutSubviews) {
         gOrigT26LayoutSubviews(self, _cmd);
     }
+    WKSApplyToolbarTransparency(self);
     WKSApplyKeyboardGlassBackgroundForPanel(self);
 }
 
@@ -2756,7 +3572,10 @@ static void WKSApplyButtonBorderExcludingToolbar(UIView *view) {
         !isKeyViewLike &&
         (WKSIsToolbarCandidateView(view) ||
          WKSClassNameLooksToolbar(NSStringFromClass([view class])));
-    UIColor *borderColor = [UIColor colorWithWhite:1.0 alpha:0.85];
+    BOOL darkMode = WKSIsDarkAppearanceForView(view);
+    UIColor *borderColor = darkMode
+        ? [UIColor colorWithWhite:1.0 alpha:0.56]
+        : [UIColor colorWithWhite:1.0 alpha:0.85];
     CALayer *backgroundLayer = nil;
     @try {
         id layerObj = [view valueForKey:@"backgroundLayer"];
@@ -2782,20 +3601,15 @@ static void WKSApplyButtonBorderExcludingToolbar(UIView *view) {
             backgroundLayer.backgroundColor = UIColor.clearColor.CGColor;
         }
     } else {
-        CGFloat cornerRadius = 8.0;
-        CALayer *glassLayer = backgroundLayer ?: view.layer;
-        CALayer *otherLayer = (glassLayer == view.layer) ? backgroundLayer : view.layer;
-        if (otherLayer && otherLayer != glassLayer) {
-            WKSRemoveModernGlassLayers(otherLayer);
+        WKSRemoveModernGlassLayers(view.layer);
+        if (backgroundLayer && backgroundLayer != view.layer) {
+            WKSRemoveModernGlassLayers(backgroundLayer);
         }
-
-        WKSApplyModernGlassLayers(glassLayer, cornerRadius);
-
         view.layer.borderWidth = 0.0;
         view.layer.borderColor = nil;
-        if (glassLayer != view.layer) {
-            glassLayer.borderWidth = 0.0;
-            glassLayer.borderColor = nil;
+        if (backgroundLayer && backgroundLayer != view.layer) {
+            backgroundLayer.borderWidth = 0.0;
+            backgroundLayer.borderColor = nil;
         }
 
         @try {
@@ -2815,7 +3629,6 @@ static void WKSAppButtonLayoutSubviews(id self, SEL _cmd) {
         gOrigAppButtonLayoutSubviews(self, _cmd);
     }
     UIView *view = (UIView *)self;
-    WKSClearViewBackground(view);
     WKSApplyButtonBorderExcludingToolbar(view);
 }
 
@@ -2824,7 +3637,6 @@ static void WKSButtonLayoutSubviews(id self, SEL _cmd) {
         gOrigButtonLayoutSubviews(self, _cmd);
     }
     UIView *view = (UIView *)self;
-    WKSClearViewBackground(view);
     WKSApplyButtonBorderExcludingToolbar(view);
 }
 

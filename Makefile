@@ -31,6 +31,13 @@ include $(THEOS_MAKE_PATH)/aggregate.mk
 after-stage::
 	$(ECHO_NOTHING)mkdir -p $(THEOS_STAGING_DIR)/Library/PreferenceLoader/Preferences$(ECHO_END)
 	$(ECHO_NOTHING)cp WKSPreferences/entry.plist $(THEOS_STAGING_DIR)/Library/PreferenceLoader/Preferences/com.yourname.wechatkeyboardswitch.plist$(ECHO_END)
+	$(ECHO_NOTHING)mkdir -p $(THEOS_STAGING_DIR)/Library/Application\ Support/WeChatKeyboardSwitch$(ECHO_END)
+	$(ECHO_NOTHING)cp SkinAssets/bda_back_dark.png $(THEOS_STAGING_DIR)/Library/Application\ Support/WeChatKeyboardSwitch/bda_back_dark.png$(ECHO_END)
+	$(ECHO_NOTHING)cp SkinAssets/bda_back_light.png $(THEOS_STAGING_DIR)/Library/Application\ Support/WeChatKeyboardSwitch/bda_back_light.png$(ECHO_END)
+	$(ECHO_NOTHING)mkdir -p $(THEOS_STAGING_DIR)/Library/Application\ Support/WeChatKeyboardSwitch/llee_light$(ECHO_END)
+	$(ECHO_NOTHING)mkdir -p $(THEOS_STAGING_DIR)/Library/Application\ Support/WeChatKeyboardSwitch/llee_dark$(ECHO_END)
+	$(ECHO_NOTHING)cp SkinAssets/llee_light/*lleeimage_*.png $(THEOS_STAGING_DIR)/Library/Application\ Support/WeChatKeyboardSwitch/llee_light/$(ECHO_END)
+	$(ECHO_NOTHING)cp SkinAssets/llee_dark/*lleeimage_*.png $(THEOS_STAGING_DIR)/Library/Application\ Support/WeChatKeyboardSwitch/llee_dark/$(ECHO_END)
 
 after-install::
 	install.exec "killall -9 wxkb_plugin WeType || true"
