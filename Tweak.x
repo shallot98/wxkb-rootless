@@ -44,6 +44,10 @@ static const CGFloat kWKSSwipeEndTriggerDistance = 12.0;
 static const NSTimeInterval kWKSSwipeEndMinGestureAgeSeconds = 0.01;
 static const NSTimeInterval kWKSSwipeEndMaxGestureAgeSeconds = 1.50;
 static const NSTimeInterval kWKSRecognizerTypingGuardSeconds = 0.02;
+static const NSTimeInterval kWKSRippleMinIntervalSeconds = 0.024;
+static const NSInteger kWKSRippleFrameStride = 2;
+static const CGFloat kWKSRippleDecodeMaxSide = 240.0;
+static CFAbsoluteTime gWKSLastRippleEmitTs = 0;
 
 static void (*gOrigPanelSwipeUp)(id, SEL, id) = NULL;
 static void (*gOrigPanelSwipeDown)(id, SEL, id) = NULL;
@@ -2347,8 +2351,8 @@ static NSArray *WKSKeyboardRippleFrameCGImages(NSString *prefix, BOOL darkMode) 
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         cache = [[NSCache alloc] init];
-        cache.countLimit = 4;
-        cache.totalCostLimit = (NSUInteger)(40 * 1024 * 1024);
+        cache.countLimit = 8;
+        cache.totalCostLimit = (NSUInteger)(48 * 1024 * 1024);
     });
 
     NSString *setKey = (prefix.length == 1) ? prefix.lowercaseString : @"_default";
@@ -2384,9 +2388,9 @@ static NSArray *WKSKeyboardRippleFrameCGImages(NSString *prefix, BOOL darkMode) 
         }
 
         NSString *folder = attemptDark ? @"llee_dark" : @"llee_light";
-        NSMutableArray *tmp = [NSMutableArray arrayWithCapacity:31];
+        NSMutableArray *tmp = [NSMutableArray arrayWithCapacity:16];
         NSUInteger byteCost = 0;
-        for (NSInteger idx = 0; idx <= 30; idx++) {
+        for (NSInteger idx = 0; idx <= 30; idx += kWKSRippleFrameStride) {
             NSString *name = [attemptSet isEqualToString:@"_default"]
                 ? [NSString stringWithFormat:@"lleeimage_%ld.png", (long)idx]
                 : [NSString stringWithFormat:@"%@_lleeimage_%ld.png", attemptSet, (long)idx];
@@ -2405,8 +2409,8 @@ static NSArray *WKSKeyboardRippleFrameCGImages(NSString *prefix, BOOL darkMode) 
             CGSize rawSize = raw.size;
             CGFloat maxSide = MAX(rawSize.width, rawSize.height);
             UIImage *prepared = raw;
-            if (maxSide > 280.0) {
-                CGFloat ratio = 280.0 / maxSide;
+            if (maxSide > kWKSRippleDecodeMaxSide) {
+                CGFloat ratio = kWKSRippleDecodeMaxSide / maxSide;
                 CGSize target = CGSizeMake(MAX(1.0, floor(rawSize.width * ratio)),
                                            MAX(1.0, floor(rawSize.height * ratio)));
                 UIGraphicsBeginImageContextWithOptions(target, NO, 1.0);
@@ -2481,6 +2485,13 @@ static void WKSShowKeyboardTouchRipple(id panel, id touch) {
         return;
     }
 
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (gWKSLastRippleEmitTs > 0.0 &&
+        (now - gWKSLastRippleEmitTs) < kWKSRippleMinIntervalSeconds) {
+        return;
+    }
+    gWKSLastRippleEmitTs = now;
+
     CGPoint pointInPanel = CGPointZero;
     if (!WKSGetTouchLocationInPanel(touch, panel, &pointInPanel)) {
         return;
@@ -2537,7 +2548,7 @@ static void WKSShowKeyboardTouchRipple(id panel, id touch) {
     rippleLayer.transform = CATransform3DMakeScale(0.94, 0.94, 1.0);
     [rippleHostLayer addSublayer:rippleLayer];
 
-    while (rippleHostLayer.sublayers.count > 10) {
+    while (rippleHostLayer.sublayers.count > 8) {
         CALayer *oldest = rippleHostLayer.sublayers.firstObject;
         if (!oldest || oldest == rippleLayer) {
             break;
