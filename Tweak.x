@@ -892,8 +892,8 @@ static void WKSHandlePanelSwipeGesture(id panel, UISwipeGestureRecognizer *gestu
     if ((gesture.direction == UISwipeGestureRecognizerDirectionUp ||
          gesture.direction == UISwipeGestureRecognizerDirectionDown) &&
         WKSShouldCancelTouchForPanelSwipeUp(panel)) {
-        // 英文键盘上下滑时，下一次 touchEnd 改为 cancel，避免同时输入字母。
-        WKSSetPanelCancelTouchEndUntil(panel, now + 0.12);
+        // 九键/26 键上下滑时，下一次 touchEnd 改为 cancel，避免同时输入字母。
+        WKSSetPanelCancelTouchEndUntil(panel, now + 0.45);
     }
 
     WKSResetSwipeRecognitionState(panel);
@@ -904,12 +904,16 @@ static BOOL WKSShouldCancelTouchForPanelSwipeUp(id panelObj) {
     if (!panelObj) {
         return NO;
     }
+    Class t9Class = objc_getClass("WBT9Panel");
+    if (t9Class && [panelObj isKindOfClass:t9Class]) {
+        return YES;
+    }
     Class t26Class = objc_getClass("WBT26Panel");
     if (t26Class && [panelObj isKindOfClass:t26Class]) {
         return YES;
     }
     NSString *className = NSStringFromClass([panelObj class]);
-    return [className containsString:@"T26"];
+    return [className containsString:@"T26"] || [className containsString:@"T9"];
 }
 
 static void WKSEnsurePanelSwipeRecognizers(id panelObj) {
