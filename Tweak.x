@@ -12,6 +12,8 @@ static BOOL gWKSSwipeEnabled = YES;
 static BOOL gWKSInSwitch = NO;
 static BOOL gWKSSwitchScheduled = NO;
 static CFAbsoluteTime gWKSLastSwitchTs = 0;
+static CFAbsoluteTime gWKSLastPrefsPollTs = 0;
+static NSHashTable<UIView *> *gWKSRegisteredPanels = nil;
 __attribute__((unused)) static int gWKSSwipeCallbackDepth = 0;
 static __weak id gWKSTextUpPanel = nil;
 static uintptr_t gWKSTextUpTouchAddr = 0;
@@ -44,6 +46,7 @@ static const CGFloat kWKSSwipeEndTriggerDistance = 12.0;
 static const NSTimeInterval kWKSSwipeEndMinGestureAgeSeconds = 0.01;
 static const NSTimeInterval kWKSSwipeEndMaxGestureAgeSeconds = 1.50;
 static const NSTimeInterval kWKSRecognizerTypingGuardSeconds = 0.02;
+static const NSTimeInterval kWKSPrefsPollIntervalSeconds = 0.30;
 static const NSTimeInterval kWKSRippleMinIntervalSeconds = 0.024;
 static const NSInteger kWKSRippleFrameStride = 2;
 static const CGFloat kWKSRippleDecodeMaxSide = 240.0;
@@ -97,7 +100,7 @@ static void WKSHandleSwipe(id context);
 static void WKSAttemptToggleWhenReady(id context, int retries);
 static void WKSResetSwipeRecognitionState(id panel);
 static void WKSSwizzleClassMethod(Class cls, SEL sel, IMP newImp, IMP *oldStore);
-static void WKSLoadPreferences(void);
+static BOOL WKSLoadPreferences(void);
 static void WKSPreferencesChanged(CFNotificationCenterRef center, void *observer, CFStringRef name,
                                   const void *object, CFDictionaryRef userInfo);
 static BOOL WKSTouchHorizontalBlocked(id touch);
@@ -108,6 +111,14 @@ static void WKSEnsurePanelSwipeRecognizers(id panelObj);
 static BOOL WKSShouldCancelTouchForPanelSwipeUp(id panelObj);
 static BOOL WKSIsKeyViewLike(UIView *view);
 static void WKSShowKeyboardTouchRipple(id panel, id touch);
+static void WKSMaybePollPreferences(void);
+static void WKSRegisterPanelForSwipeSync(id panelObj);
+static void WKSSyncPanelSwipeRecognizerEnabled(id panelObj);
+static void WKSSyncAllPanelSwipeRecognizerEnabled(void);
+static void WKSReloadAndSyncPanels(void);
+
+static const void *kWKSPanelSwipeUpRecognizerAssocKey;
+static const void *kWKSPanelSwipeDownRecognizerAssocKey;
 
 @interface WKSPanelSwipeGestureBridge : NSObject <UIGestureRecognizerDelegate>
 + (instancetype)shared;
@@ -140,18 +151,131 @@ static void WKSShowKeyboardTouchRipple(id panel, id touch);
 }
 @end
 
-static void WKSLoadPreferences(void) {
-    CFPreferencesAppSynchronize(CFSTR("com.yourname.wechatkeyboardswitch"));
-    CFTypeRef val = CFPreferencesCopyAppValue(CFSTR("swipeEnabled"),
-                                              CFSTR("com.yourname.wechatkeyboardswitch"));
+static BOOL WKSLoadPreferences(void) {
+    BOOL found = NO;
+    BOOL enabled = gWKSSwipeEnabled;
+
+    CFStringRef appID = CFSTR("com.yourname.wechatkeyboardswitch");
+    CFPreferencesAppSynchronize(appID);
+
+    Boolean keyExists = false;
+    Boolean boolValue = CFPreferencesGetAppBooleanValue(CFSTR("swipeEnabled"), appID, &keyExists);
+    if (keyExists) {
+        enabled = (BOOL)boolValue;
+        found = YES;
+    } else {
+        CFArrayRef keys = CFPreferencesCopyKeyList(appID,
+                                                   kCFPreferencesCurrentUser,
+                                                   kCFPreferencesAnyHost);
+        if (!keys) {
+            keys = CFPreferencesCopyKeyList(appID,
+                                            kCFPreferencesAnyUser,
+                                            kCFPreferencesAnyHost);
+        }
+        if (keys) {
+            // 域可读但 key 不存在：按默认值 true 处理（PSSwitch default=true 常见表现）
+            enabled = YES;
+            found = YES;
+            CFRelease(keys);
+        }
+    }
+
+    CFTypeRef val = CFPreferencesCopyValue(CFSTR("swipeEnabled"), appID,
+                                           kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+    if (!val) {
+        val = CFPreferencesCopyValue(CFSTR("swipeEnabled"), appID,
+                                     kCFPreferencesAnyUser, kCFPreferencesAnyHost);
+    }
     if (val) {
         if (CFGetTypeID(val) == CFBooleanGetTypeID()) {
-            gWKSSwipeEnabled = CFBooleanGetValue((CFBooleanRef)val);
+            enabled = CFBooleanGetValue((CFBooleanRef)val);
+            found = YES;
+        } else if (CFGetTypeID(val) == CFNumberGetTypeID()) {
+            int numberValue = 0;
+            if (CFNumberGetValue((CFNumberRef)val, kCFNumberIntType, &numberValue)) {
+                enabled = (numberValue != 0);
+                found = YES;
+            }
         }
         CFRelease(val);
-    } else {
-        gWKSSwipeEnabled = YES; // 默认开启
     }
+
+    if (!found) {
+        NSArray<NSString *> *paths = @[
+            @"/var/mobile/Library/Preferences/com.yourname.wechatkeyboardswitch.plist",
+            @"/var/jb/var/mobile/Library/Preferences/com.yourname.wechatkeyboardswitch.plist",
+            @"/var/root/Library/Preferences/com.yourname.wechatkeyboardswitch.plist",
+            @"/var/jb/var/root/Library/Preferences/com.yourname.wechatkeyboardswitch.plist"
+        ];
+
+        for (NSString *path in paths) {
+            NSDictionary *dict = [NSDictionary dictionaryWithContentsOfFile:path];
+            if (![dict isKindOfClass:[NSDictionary class]]) {
+                continue;
+            }
+            id value = dict[@"swipeEnabled"];
+            if ([value isKindOfClass:[NSNumber class]]) {
+                enabled = [(NSNumber *)value boolValue];
+            } else {
+                // 文件可读但 key 不存在：同样按默认值 true
+                enabled = YES;
+            }
+            found = YES;
+            break;
+        }
+    }
+
+    if (found) {
+        gWKSSwipeEnabled = enabled;
+    }
+    return found;
+}
+
+static void WKSMaybePollPreferences(void) {
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if ((now - gWKSLastPrefsPollTs) < kWKSPrefsPollIntervalSeconds) {
+        return;
+    }
+    gWKSLastPrefsPollTs = now;
+    (void)WKSLoadPreferences();
+}
+
+static void WKSRegisterPanelForSwipeSync(id panelObj) {
+    if (!panelObj || ![panelObj isKindOfClass:[UIView class]]) {
+        return;
+    }
+    if (!gWKSRegisteredPanels) {
+        gWKSRegisteredPanels = [NSHashTable weakObjectsHashTable];
+    }
+    [gWKSRegisteredPanels addObject:(UIView *)panelObj];
+}
+
+static void WKSSyncPanelSwipeRecognizerEnabled(id panelObj) {
+    if (!panelObj || ![panelObj isKindOfClass:[UIView class]]) {
+        return;
+    }
+    UIView *panel = (UIView *)panelObj;
+    UISwipeGestureRecognizer *swipeUp =
+        objc_getAssociatedObject(panel, kWKSPanelSwipeUpRecognizerAssocKey);
+    UISwipeGestureRecognizer *swipeDown =
+        objc_getAssociatedObject(panel, kWKSPanelSwipeDownRecognizerAssocKey);
+    if (swipeUp) {
+        swipeUp.enabled = gWKSSwipeEnabled;
+    }
+    if (swipeDown) {
+        swipeDown.enabled = gWKSSwipeEnabled;
+    }
+}
+
+static void WKSSyncAllPanelSwipeRecognizerEnabled(void) {
+    for (UIView *panel in gWKSRegisteredPanels) {
+        WKSSyncPanelSwipeRecognizerEnabled(panel);
+    }
+}
+
+static void WKSReloadAndSyncPanels(void) {
+    (void)WKSLoadPreferences();
+    WKSSyncAllPanelSwipeRecognizerEnabled();
 }
 
 static void WKSPreferencesChanged(CFNotificationCenterRef center, void *observer, CFStringRef name,
@@ -161,7 +285,24 @@ static void WKSPreferencesChanged(CFNotificationCenterRef center, void *observer
     (void)name;
     (void)object;
     (void)userInfo;
-    WKSLoadPreferences();
+    BOOL oldValue = gWKSSwipeEnabled;
+    BOOL loaded = WKSLoadPreferences();
+    if (!loaded) {
+        // 设置进程发来的通知已确认发生变化，但当前进程无法读到偏好时，退化为翻转状态。
+        gWKSSwipeEnabled = !oldValue;
+    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+        WKSSyncAllPanelSwipeRecognizerEnabled();
+        // 设置开关写入/删键存在异步落盘，追加两次延迟重读，避免“关->开首拍失效”。
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.12 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            WKSReloadAndSyncPanels();
+        });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            WKSReloadAndSyncPanels();
+        });
+    });
 }
 
 static const void *kWKSTouchStartPointAssocKey = &kWKSTouchStartPointAssocKey;
@@ -853,6 +994,7 @@ static BOOL WKSGesturePointShouldKeepNative(id panel, CGPoint point) {
 }
 
 static BOOL WKSShouldAllowPanelSwipeTouch(id panel, UITouch *touch) {
+    WKSMaybePollPreferences();
     if (!WKSUseGestureRecognizerMode() || !gWKSSwipeEnabled) {
         return NO;
     }
@@ -867,6 +1009,7 @@ static BOOL WKSShouldAllowPanelSwipeTouch(id panel, UITouch *touch) {
 }
 
 static void WKSHandlePanelSwipeGesture(id panel, UISwipeGestureRecognizer *gesture) {
+    WKSMaybePollPreferences();
     if (!WKSUseGestureRecognizerMode() || !gWKSSwipeEnabled) {
         return;
     }
@@ -921,6 +1064,7 @@ static void WKSEnsurePanelSwipeRecognizers(id panelObj) {
         return;
     }
     UIView *panel = (UIView *)panelObj;
+    WKSRegisterPanelForSwipeSync(panelObj);
     WKSPanelSwipeGestureBridge *bridge = [WKSPanelSwipeGestureBridge shared];
 
     UISwipeGestureRecognizer *swipeUp = objc_getAssociatedObject(panel, kWKSPanelSwipeUpRecognizerAssocKey);
@@ -3044,6 +3188,7 @@ static void WKSAttemptToggleWhenReady(id context, int retries) {
 }
 
 static void WKSHandleSwipe(id context) {
+    WKSMaybePollPreferences();
     if (!gWKSSwipeEnabled) {
         return;
     }
@@ -3152,6 +3297,7 @@ static void WKSPanelTouchesCancelled(id self, SEL _cmd, id touches, id event) {
 }
 
 static void WKSPanelProcessTouchBegan(id self, SEL _cmd, id touch, id keyView) {
+    WKSSyncPanelSwipeRecognizerEnabled(self);
     BOOL keepNativeSwipe = (WKSIsSpaceKeyView(keyView) || WKSPanelIsDeleteKeyView(self, keyView));
     WKSSetTouchBeganTimestamp(touch, CFAbsoluteTimeGetCurrent());
     WKSSetTouchSwitchHandled(touch, NO);
@@ -3767,7 +3913,7 @@ static void WKSSwizzleClassMethod(Class cls, SEL sel, IMP newImp, IMP *oldStore)
 
 __attribute__((constructor))
 static void WKSInit(void) {
-    WKSLoadPreferences();
+    (void)WKSLoadPreferences();
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
                                     WKSPreferencesChanged,
                                     CFSTR("com.yourname.wechatkeyboardswitch/preferences.changed"), NULL,

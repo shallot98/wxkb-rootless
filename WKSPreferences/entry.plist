@@ -5,19 +5,54 @@
     <key>entry</key>
     <dict>
         <key>cell</key>
-        <string>PSSwitchCell</string>
-        <key>default</key>
-        <true/>
-        <key>defaults</key>
-        <string>com.yourname.wechatkeyboardswitch</string>
-        <key>key</key>
-        <string>swipeEnabled</string>
+        <string>PSLinkCell</string>
         <key>label</key>
         <string>微信键盘切换</string>
         <key>icon</key>
-        <string>/Applications/Preferences.app/icon-table@2x.png</string>
-        <key>PostNotification</key>
-        <string>com.yourname.wechatkeyboardswitch/preferences.changed</string>
+        <string>/var/jb/Library/PreferenceLoader/Preferences/com.yourname.wechatkeyboardswitch/icon.png</string>
     </dict>
+    <key>title</key>
+    <string>微信键盘切换</string>
+    <key>items</key>
+    <array>
+        <dict>
+            <key>cell</key>
+            <string>PSGroupCell</string>
+            <key>label</key>
+            <string>手势设置</string>
+        </dict>
+        <dict>
+            <key>cell</key>
+            <string>PSSwitchCell</string>
+            <key>default</key>
+            <true/>
+            <key>defaults</key>
+            <string>com.yourname.wechatkeyboardswitch</string>
+            <key>key</key>
+            <string>swipeEnabled</string>
+            <key>label</key>
+            <string>上下滑动切换键盘</string>
+            <key>PostNotification</key>
+            <string>com.yourname.wechatkeyboardswitch/preferences.changed</string>
+        </dict>
+        <dict>
+            <key>cell</key>
+            <string>PSGroupCell</string>
+            <key>label</key>
+            <string>关于</string>
+        </dict>
+        <dict>
+            <key>cell</key>
+            <string>PSStaticTextCell</string>
+            <key>label</key>
+            <string>作者：guanxi</string>
+        </dict>
+        <dict>
+            <key>cell</key>
+            <string>PSStaticTextCell</string>
+            <key>label</key>
+            <string>版本：1.0.0</string>
+        </dict>
+    </array>
 </dict>
 </plist>

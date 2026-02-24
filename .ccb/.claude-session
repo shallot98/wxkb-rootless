@@ -1,0 +1,16 @@
+{
+  "session_id": "ai-1771396856-3159355",
+  "ccb_project_id": "a45e7fabfdff6cf0ee7b0c3af3a19b7822cb032948b3d51bef9c90107f351b32",
+  "work_dir": "/root/wxkb/WeChatKeyboardSwitch",
+  "work_dir_norm": "/root/wxkb/WeChatKeyboardSwitch",
+  "start_dir": "/root/wxkb/WeChatKeyboardSwitch",
+  "terminal": "tmux",
+  "active": true,
+  "started_at": "2026-02-18 12:25:40",
+  "updated_at": "2026-02-18 19:02:27",
+  "pane_id": "%18",
+  "pane_title_marker": "CCB-Claude",
+  "ended_at": "2026-02-18 12:25:52",
+  "claude_session_path": "/root/.claude/projects/-root/3533dff1-328f-4338-90e0-330037fc60c2.jsonl",
+  "claude_session_id": "3533dff1-328f-4338-90e0-330037fc60c2"
+}

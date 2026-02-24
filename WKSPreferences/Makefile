@@ -1,10 +1,15 @@
 BUNDLE_NAME = WKSPreferences
 WKSPreferences_BUNDLE_EXTENSION = bundle
+ifeq ($(THEOS_PACKAGE_SCHEME),roothide)
+WKSPreferences_ARCHS = arm64 arm64e
+else
 WKSPreferences_ARCHS = arm64
+endif
 WKSPreferences_FILES = WKSRootListController.m
 WKSPreferences_FRAMEWORKS = UIKit
 WKSPreferences_PRIVATE_FRAMEWORKS = Preferences
 WKSPreferences_INSTALL_PATH = /Library/PreferenceBundles
+WKSPreferences_RESOURCE_FILES = entry.plist
 WKSPreferences_CFLAGS = -fobjc-arc
 
 include $(THEOS)/makefiles/common.mk

@@ -30,11 +30,15 @@
     </dict>
     <dict>
         <key>cell</key>
-        <string>PSTitleValueCell</string>
+        <string>PSStaticTextCell</string>
         <key>label</key>
-        <string>版本</string>
-        <key>default</key>
-        <string>1.0.0</string>
+        <string>作者：guanxi</string>
+    </dict>
+    <dict>
+        <key>cell</key>
+        <string>PSStaticTextCell</string>
+        <key>label</key>
+        <string>版本：1.0.0</string>
     </dict>
 </array>
 </plist>

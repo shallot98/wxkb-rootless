@@ -1,0 +1,19 @@
+{
+  "session_id": "ai-1771387805-3120984",
+  "ccb_project_id": "a45e7fabfdff6cf0ee7b0c3af3a19b7822cb032948b3d51bef9c90107f351b32",
+  "runtime_dir": "/tmp/claude-ai-root/ai-1771387805-3120984/gemini",
+  "terminal": "tmux",
+  "tmux_session": null,
+  "pane_id": "%0",
+  "pane_title_marker": "CCB-Gemini",
+  "work_dir": "/root/wxkb/WeChatKeyboardSwitch",
+  "work_dir_norm": "/root/wxkb/WeChatKeyboardSwitch",
+  "start_dir": "/root/wxkb/WeChatKeyboardSwitch",
+  "active": false,
+  "started_at": "2026-02-18 12:10:05",
+  "start_cmd": "export CCB_MANAGED=1; export CCB_PARENT_PID=3120984; export CCB_RUN_DIR=/root/.cache/ccb/projects/a45e7fabfdff6cf0; export PATH=/root/.local/share/codex-dual/bin:/root/.codex/tmp/arg0/codex-arg0uCscE2:/usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/path:/root/.opencode/bin:/root/.local/bin:/usr/lib/go-1.24/bin:/opt/theos/bin:/root/.opencode/bin:/root/.cargo/bin:/root/.local/bin:/usr/lib/go-1.24/bin:/opt/theos/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin; gemini",
+  "gemini_session_path": "/root/.gemini/tmp/a45e7fabfdff6cf0ee7b0c3af3a19b7822cb032948b3d51bef9c90107f351b32/chats/session-2026-02-18T04-10-85ab0123.json",
+  "gemini_project_hash": "a45e7fabfdff6cf0ee7b0c3af3a19b7822cb032948b3d51bef9c90107f351b32",
+  "gemini_session_id": "85ab0123-2775-49ab-8fe9-b5fad9b05b2c",
+  "ended_at": "2026-02-18 12:25:52"
+}
