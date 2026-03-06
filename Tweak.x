@@ -87,6 +87,8 @@ static void (*gOrigButtonLayoutSubviews)(id, SEL) = NULL;
 static void (*gOrigKeyViewLayoutSubviews)(id, SEL) = NULL;
 static void (*gOrigKeyViewSetHighlighted)(id, SEL, BOOL) = NULL;
 static void (*gOrigKeyViewInternalSetHighlighted)(id, SEL, BOOL) = NULL;
+static void (*gOrigKeyViewUpdateForegroundImage)(id, SEL) = NULL;
+static void (*gOrigKeyViewUpdateTintColor)(id, SEL) = NULL;
 static void (*gOrigKeyViewUpdateBackgroundColor)(id, SEL) = NULL;
 static void (*gOrigKeyViewRemoveHighlighted)(id, SEL) = NULL;
 static void (*gOrigAppButtonSetHighlighted)(id, SEL, BOOL) = NULL;
@@ -95,6 +97,10 @@ static void (*gOrigSymbolCellSetHighlighted)(id, SEL, BOOL) = NULL;
 static void (*gOrigSymbolCellUpdateBackgroundColor)(id, SEL) = NULL;
 static void (*gOrigRuleKeyUpdateKeyAppearance)(id, SEL) = NULL;
 static void (*gOrigReturnKeyUpdateReturnStyle)(id, SEL) = NULL;
+static id (*gOrigReturnKeyHighlightedBgForCurrentState)(id, SEL) = NULL;
+static id (*gOrigReturnKeyNormalBgColorForCurrentState)(id, SEL) = NULL;
+static id (*gOrigReturnKeyHighlightedTintColorForCurrentState)(id, SEL) = NULL;
+static id (*gOrigReturnKeyNormalTintColorForCurrentState)(id, SEL) = NULL;
 static void (*gOrigNewlineResponsibleForNewlineDidChange)(id, SEL) = NULL;
 static void (*gOrigTopBarLayoutSubviews)(id, SEL) = NULL;
 static void (*gOrigToolBarAuxLayoutSubviews)(id, SEL) = NULL;
@@ -126,6 +132,8 @@ static void WKSRegisterPanelForSwipeSync(id panelObj);
 static void WKSSyncPanelSwipeRecognizerEnabled(id panelObj);
 static void WKSSyncAllPanelSwipeRecognizerEnabled(void);
 static void WKSReloadAndSyncPanels(void);
+static void WKSApplyReturnKeyForcedTextColor(UIView *view, BOOL highlighted);
+static void WKSApplyDeleteKeyForcedTint(UIView *view, BOOL highlighted);
 
 static const void *kWKSPanelSwipeUpRecognizerAssocKey;
 static const void *kWKSPanelSwipeDownRecognizerAssocKey;
@@ -887,6 +895,50 @@ static BOOL WKSIsDeleteKeyView(id keyView) {
         }
     }
     return NO;
+}
+
+static UIColor *WKSDeleteKeyForcedTintColor(BOOL highlighted) {
+    return highlighted
+        ? [UIColor colorWithWhite:0.0 alpha:0.98]
+        : [UIColor colorWithWhite:0.0 alpha:0.90];
+}
+
+static void WKSApplyTintToContentRecursive(UIView *view, UIColor *color, int depth) {
+    if (!view || !color || depth > 3) {
+        return;
+    }
+    if ([view isKindOfClass:[UILabel class]]) {
+        ((UILabel *)view).textColor = color;
+    } else if ([view isKindOfClass:[UIImageView class]]) {
+        UIImageView *imageView = (UIImageView *)view;
+        if (imageView.image) {
+            imageView.image = [imageView.image imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+        }
+        imageView.tintColor = color;
+    }
+    view.tintColor = color;
+    for (UIView *sub in view.subviews) {
+        WKSApplyTintToContentRecursive(sub, color, depth + 1);
+    }
+}
+
+static void WKSApplyDeleteKeyForcedTint(UIView *view, BOOL highlighted) {
+    if (!view || !WKSIsDeleteKeyView(view)) {
+        return;
+    }
+    UIColor *color = WKSDeleteKeyForcedTintColor(highlighted);
+    WKSApplyTintToContentRecursive(view, color, 0);
+    @try {
+        id imageViewObj = [view valueForKey:@"imageView"];
+        if ([imageViewObj isKindOfClass:[UIImageView class]]) {
+            UIImageView *imageView = (UIImageView *)imageViewObj;
+            if (imageView.image) {
+                imageView.image = [imageView.image imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+            }
+            imageView.tintColor = color;
+        }
+    } @catch (__unused NSException *e) {
+    }
 }
 
 static BOOL WKSPanelIsDeleteKeyView(id panel, id keyView) {
@@ -2009,6 +2061,10 @@ static void WKSNeutralizeNativePressedWhitening(UIView *view) {
     if (!view) {
         return;
     }
+    // 仅对主键类视图抑制“泛白高亮”，避免误伤左侧图标栏等非 KeyView 控件的原生选中反馈。
+    if (!WKSIsKeyViewLike(view)) {
+        return;
+    }
     @try {
         if ([view respondsToSelector:@selector(setAdjustsButtonWhenHighlighted:)]) {
             [view setValue:@NO forKey:@"adjustsButtonWhenHighlighted"];
@@ -2126,26 +2182,26 @@ static void WKSApplyKeyPressedColorState(UIView *view, BOOL highlighted) {
 
     if (highlighted) {
         CGFloat hue = WKSGetOrCreateKeyPressedHue(view);
-        CGFloat hueShift = darkMode ? 0.08f : 0.06f;
+        CGFloat hueShift = darkMode ? 0.04f : 0.03f;
         CGFloat hue2 = fmod(hue + hueShift, 1.0f);
         if (fill) {
             fill.colors = darkMode
-                ? @[(id)[UIColor colorWithHue:hue saturation:0.72 brightness:0.92 alpha:0.56].CGColor,
-                    (id)[UIColor colorWithHue:hue2 saturation:0.62 brightness:0.84 alpha:0.40].CGColor]
-                : @[(id)[UIColor colorWithHue:hue saturation:0.62 brightness:1.00 alpha:0.78].CGColor,
-                    (id)[UIColor colorWithHue:hue2 saturation:0.52 brightness:0.96 alpha:0.58].CGColor];
+                ? @[(id)[UIColor colorWithHue:hue saturation:0.42 brightness:0.88 alpha:0.66].CGColor,
+                    (id)[UIColor colorWithHue:hue2 saturation:0.32 brightness:0.80 alpha:0.50].CGColor]
+                : @[(id)[UIColor colorWithHue:hue saturation:0.38 brightness:0.95 alpha:0.70].CGColor,
+                    (id)[UIColor colorWithHue:hue2 saturation:0.28 brightness:0.90 alpha:0.54].CGColor];
             fill.opacity = 1.0f;
         }
         if (gloss) {
             gloss.colors = darkMode
-                ? @[(id)[UIColor colorWithHue:hue saturation:0.20 brightness:1.0 alpha:0.24].CGColor,
-                    (id)[UIColor colorWithHue:hue2 saturation:0.10 brightness:1.0 alpha:0.06].CGColor]
-                : @[(id)[UIColor colorWithHue:hue saturation:0.16 brightness:1.0 alpha:0.44].CGColor,
-                    (id)[UIColor colorWithHue:hue2 saturation:0.08 brightness:1.0 alpha:0.14].CGColor];
+                ? @[(id)[UIColor colorWithHue:hue saturation:0.12 brightness:1.0 alpha:0.22].CGColor,
+                    (id)[UIColor colorWithHue:hue2 saturation:0.06 brightness:1.0 alpha:0.08].CGColor]
+                : @[(id)[UIColor colorWithHue:hue saturation:0.11 brightness:1.0 alpha:0.28].CGColor,
+                    (id)[UIColor colorWithHue:hue2 saturation:0.05 brightness:1.0 alpha:0.12].CGColor];
         }
         view.layer.borderColor = darkMode
-            ? [UIColor colorWithHue:hue saturation:0.52 brightness:1.0 alpha:0.66].CGColor
-            : [UIColor colorWithHue:hue saturation:0.40 brightness:1.0 alpha:0.98].CGColor;
+            ? [UIColor colorWithHue:hue saturation:0.34 brightness:1.0 alpha:0.70].CGColor
+            : [UIColor colorWithHue:hue saturation:0.28 brightness:1.0 alpha:0.78].CGColor;
     } else {
         WKSApplyMainKeyButtonStyle(view, darkMode);
     }
@@ -4456,6 +4512,7 @@ static void WKSKeyViewLayoutSubviews(id self, SEL _cmd) {
     WKSApplyButtonBorderExcludingToolbar((UIView *)self);
     WKSApplyKeyPressedColorState((UIView *)self, WKSGetKeyPressedColorState((UIView *)self));
     WKSNeutralizeNativePressedWhitening((UIView *)self);
+    WKSApplyDeleteKeyForcedTint((UIView *)self, WKSGetKeyPressedColorState((UIView *)self));
 }
 
 static void WKSKeyViewSetHighlighted(id self, SEL _cmd, BOOL highlighted) {
@@ -4465,6 +4522,7 @@ static void WKSKeyViewSetHighlighted(id self, SEL _cmd, BOOL highlighted) {
     WKSSetKeyPressedColorState((UIView *)self, highlighted);
     WKSApplyKeyPressedColorState((UIView *)self, highlighted);
     WKSNeutralizeNativePressedWhitening((UIView *)self);
+    WKSApplyDeleteKeyForcedTint((UIView *)self, highlighted);
 }
 
 static void WKSKeyViewInternalSetHighlighted(id self, SEL _cmd, BOOL highlighted) {
@@ -4474,6 +4532,21 @@ static void WKSKeyViewInternalSetHighlighted(id self, SEL _cmd, BOOL highlighted
     WKSSetKeyPressedColorState((UIView *)self, highlighted);
     WKSApplyKeyPressedColorState((UIView *)self, highlighted);
     WKSNeutralizeNativePressedWhitening((UIView *)self);
+    WKSApplyDeleteKeyForcedTint((UIView *)self, highlighted);
+}
+
+static void WKSKeyViewUpdateForegroundImage(id self, SEL _cmd) {
+    if (gOrigKeyViewUpdateForegroundImage) {
+        gOrigKeyViewUpdateForegroundImage(self, _cmd);
+    }
+    WKSApplyDeleteKeyForcedTint((UIView *)self, WKSGetKeyPressedColorState((UIView *)self));
+}
+
+static void WKSKeyViewUpdateTintColor(id self, SEL _cmd) {
+    if (gOrigKeyViewUpdateTintColor) {
+        gOrigKeyViewUpdateTintColor(self, _cmd);
+    }
+    WKSApplyDeleteKeyForcedTint((UIView *)self, WKSGetKeyPressedColorState((UIView *)self));
 }
 
 static void WKSKeyViewUpdateBackgroundColor(id self, SEL _cmd) {
@@ -4483,6 +4556,7 @@ static void WKSKeyViewUpdateBackgroundColor(id self, SEL _cmd) {
     WKSNeutralizeNativePressedWhitening((UIView *)self);
     WKSApplyButtonBorderExcludingToolbar((UIView *)self);
     WKSApplyKeyPressedColorState((UIView *)self, WKSGetKeyPressedColorState((UIView *)self));
+    WKSApplyDeleteKeyForcedTint((UIView *)self, WKSGetKeyPressedColorState((UIView *)self));
 }
 
 static void WKSKeyViewRemoveHighlighted(id self, SEL _cmd) {
@@ -4493,6 +4567,7 @@ static void WKSKeyViewRemoveHighlighted(id self, SEL _cmd) {
     WKSNeutralizeNativePressedWhitening((UIView *)self);
     WKSApplyButtonBorderExcludingToolbar((UIView *)self);
     WKSApplyKeyPressedColorState((UIView *)self, NO);
+    WKSApplyDeleteKeyForcedTint((UIView *)self, NO);
 }
 
 static void WKSRuleKeyUpdateKeyAppearance(id self, SEL _cmd) {
@@ -4507,6 +4582,89 @@ static void WKSReturnKeyUpdateReturnStyle(id self, SEL _cmd) {
         gOrigReturnKeyUpdateReturnStyle(self, _cmd);
     }
     WKSApplyButtonBorderExcludingToolbar((UIView *)self);
+    WKSApplyReturnKeyForcedTextColor((UIView *)self, WKSGetKeyPressedColorState((UIView *)self));
+}
+
+static UIColor *WKSReturnKeyForcedBackgroundColor(UIView *view, BOOL highlighted) {
+    BOOL darkMode = WKSIsDarkAppearanceForView(view);
+    if (highlighted) {
+        return darkMode
+            ? [UIColor colorWithWhite:0.02 alpha:0.96]
+            : [UIColor colorWithWhite:0.0 alpha:0.90];
+    }
+    return darkMode
+        ? [UIColor colorWithWhite:0.06 alpha:0.86]
+        : [UIColor colorWithWhite:0.08 alpha:0.82];
+}
+
+static UIColor *WKSReturnKeyForcedTextColor(UIView *view, BOOL highlighted) {
+    (void)view;
+    return highlighted
+        ? [UIColor colorWithWhite:0.0 alpha:0.98]
+        : [UIColor colorWithWhite:0.0 alpha:0.90];
+}
+
+static void WKSApplyReturnKeyForcedTextColor(UIView *view, BOOL highlighted) {
+    if (!view) {
+        return;
+    }
+    UIColor *textColor = WKSReturnKeyForcedTextColor(view, highlighted);
+    view.tintColor = textColor;
+    @try {
+        id labelObj = [view valueForKey:@"label"];
+        if ([labelObj isKindOfClass:[UILabel class]]) {
+            ((UILabel *)labelObj).textColor = textColor;
+        }
+        id subLabelObj = [view valueForKey:@"subLabel"];
+        if ([subLabelObj isKindOfClass:[UILabel class]]) {
+            ((UILabel *)subLabelObj).textColor = textColor;
+        }
+    } @catch (__unused NSException *e) {
+    }
+}
+
+static id WKSReturnKeyHighlightedBgForCurrentState(id self, SEL _cmd) {
+    if (gOrigReturnKeyHighlightedBgForCurrentState) {
+        (void)gOrigReturnKeyHighlightedBgForCurrentState(self, _cmd);
+    }
+    if ([self isKindOfClass:[UIView class]]) {
+        return WKSReturnKeyForcedBackgroundColor((UIView *)self, YES);
+    }
+    return [UIColor colorWithWhite:0.0 alpha:0.90];
+}
+
+static id WKSReturnKeyNormalBgColorForCurrentState(id self, SEL _cmd) {
+    if (gOrigReturnKeyNormalBgColorForCurrentState) {
+        (void)gOrigReturnKeyNormalBgColorForCurrentState(self, _cmd);
+    }
+    if ([self isKindOfClass:[UIView class]]) {
+        return WKSReturnKeyForcedBackgroundColor((UIView *)self, NO);
+    }
+    return [UIColor colorWithWhite:0.08 alpha:0.82];
+}
+
+static id WKSReturnKeyHighlightedTintColorForCurrentState(id self, SEL _cmd) {
+    if (gOrigReturnKeyHighlightedTintColorForCurrentState) {
+        (void)gOrigReturnKeyHighlightedTintColorForCurrentState(self, _cmd);
+    }
+    if ([self isKindOfClass:[UIView class]]) {
+        UIColor *color = WKSReturnKeyForcedTextColor((UIView *)self, YES);
+        WKSApplyReturnKeyForcedTextColor((UIView *)self, YES);
+        return color;
+    }
+    return [UIColor colorWithWhite:0.0 alpha:0.98];
+}
+
+static id WKSReturnKeyNormalTintColorForCurrentState(id self, SEL _cmd) {
+    if (gOrigReturnKeyNormalTintColorForCurrentState) {
+        (void)gOrigReturnKeyNormalTintColorForCurrentState(self, _cmd);
+    }
+    if ([self isKindOfClass:[UIView class]]) {
+        UIColor *color = WKSReturnKeyForcedTextColor((UIView *)self, NO);
+        WKSApplyReturnKeyForcedTextColor((UIView *)self, NO);
+        return color;
+    }
+    return [UIColor colorWithWhite:0.0 alpha:0.90];
 }
 
 static void WKSNewlineResponsibleForNewlineDidChange(id self, SEL _cmd) {
@@ -4717,6 +4875,12 @@ static void WKSInit(void) {
                               (IMP)WKSKeyViewSetHighlighted, (IMP *)&gOrigKeyViewSetHighlighted);
         WKSSwizzleClassMethod(keyView, @selector(_setHighlighted:),
                               (IMP)WKSKeyViewInternalSetHighlighted, (IMP *)&gOrigKeyViewInternalSetHighlighted);
+        WKSSwizzleClassMethod(keyView, @selector(updateForegroundImage),
+                              (IMP)WKSKeyViewUpdateForegroundImage,
+                              (IMP *)&gOrigKeyViewUpdateForegroundImage);
+        WKSSwizzleClassMethod(keyView, @selector(updateTintColor),
+                              (IMP)WKSKeyViewUpdateTintColor,
+                              (IMP *)&gOrigKeyViewUpdateTintColor);
         WKSSwizzleClassMethod(keyView, @selector(updateBackgroundColor),
                               (IMP)WKSKeyViewUpdateBackgroundColor,
                               (IMP *)&gOrigKeyViewUpdateBackgroundColor);
@@ -4731,6 +4895,18 @@ static void WKSInit(void) {
         Class returnKeyView = objc_getClass("WBReturnKeyView");
         WKSSwizzleClassMethod(returnKeyView, @selector(updateReturnStyle),
                               (IMP)WKSReturnKeyUpdateReturnStyle, (IMP *)&gOrigReturnKeyUpdateReturnStyle);
+        WKSSwizzleClassMethod(returnKeyView, @selector(highlightedBgForCurrentState),
+                              (IMP)WKSReturnKeyHighlightedBgForCurrentState,
+                              (IMP *)&gOrigReturnKeyHighlightedBgForCurrentState);
+        WKSSwizzleClassMethod(returnKeyView, @selector(normalBgColorForCurrentState),
+                              (IMP)WKSReturnKeyNormalBgColorForCurrentState,
+                              (IMP *)&gOrigReturnKeyNormalBgColorForCurrentState);
+        WKSSwizzleClassMethod(returnKeyView, @selector(highlightedTintColorForCurrentState),
+                              (IMP)WKSReturnKeyHighlightedTintColorForCurrentState,
+                              (IMP *)&gOrigReturnKeyHighlightedTintColorForCurrentState);
+        WKSSwizzleClassMethod(returnKeyView, @selector(normalTintColorForCurrentState),
+                              (IMP)WKSReturnKeyNormalTintColorForCurrentState,
+                              (IMP *)&gOrigReturnKeyNormalTintColorForCurrentState);
 
         Class newlineKeyView = objc_getClass("WBNewlineKeyView");
         WKSSwizzleClassMethod(newlineKeyView, @selector(responsibleForNewlineDidChange),
